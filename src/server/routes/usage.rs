@@ -6,7 +6,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::ast::known_types::extract_type_names;
+use crate::ast::known_types::{extract_type_names, tokenize_name};
 use crate::db::reader;
 use crate::server::state::{AppError, SharedState};
 use crate::types::Symbol;
@@ -20,6 +20,8 @@ pub fn router() -> Router<SharedState> {
         .route("/ast/dead_types", get(dead_types))
         .route("/ast/usage_hotspots", get(usage_hotspots))
         .route("/ast/orphans", get(orphans))
+        .route("/ast/role_groups", get(role_groups))
+        .route("/ast/find_twins", get(find_twins))
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +201,8 @@ struct ParallelSystemsQuery {
     workspace: String,
     path_prefix: Option<String>,
     min_size: Option<usize>,
+    /// "wcc" (weakly-connected components, default) or "token" (semantic token clustering)
+    mode: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -222,9 +226,35 @@ struct ParallelCandidate {
 }
 
 #[derive(Serialize)]
+struct TokenCandidatePair {
+    group_a: String,
+    group_b: String,
+    similarity_score: f64,
+    size_a: usize,
+    size_b: usize,
+    rationale: String,
+}
+
+#[derive(Serialize)]
+struct TokenGroupInfo {
+    token: String,
+    size: usize,
+    kinds: HashMap<String, usize>,
+    field_count_avg: f64,
+    total_type_use: u64,
+    names: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct ParallelSystemsResponse {
     components: Vec<ComponentInfo>,
     parallel_candidates: Vec<ParallelCandidate>,
+}
+
+#[derive(Serialize)]
+struct ParallelSystemsTokenResponse {
+    groups: Vec<TokenGroupInfo>,
+    candidate_pairs: Vec<TokenCandidatePair>,
 }
 
 async fn parallel_systems(
@@ -234,6 +264,11 @@ async fn parallel_systems(
     let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
     let min_size = params.min_size.unwrap_or(5);
     let workspace = &params.workspace;
+    let mode = params.mode.as_deref().unwrap_or("wcc");
+
+    if mode == "token" {
+        return parallel_systems_token(&db, workspace, params.path_prefix.as_deref(), min_size);
+    }
 
     // Load structural symbols only.
     let struct_kinds: &[&str] = &["struct", "enum", "trait", "type_alias"];
@@ -399,6 +434,133 @@ async fn parallel_systems(
     parallel_candidates.sort_by(|a, b| a.profile_distance.partial_cmp(&b.profile_distance).unwrap_or(std::cmp::Ordering::Equal));
 
     let resp = ParallelSystemsResponse { components, parallel_candidates };
+    Ok(Json(serde_json::json!(resp)))
+}
+
+fn parallel_systems_token(
+    db: &rusqlite::Connection,
+    workspace: &str,
+    path_prefix: Option<&str>,
+    min_size: usize,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let struct_kinds: &[&str] = &["struct", "enum", "trait", "type_alias"];
+    let all_syms = reader::get_all_symbols_filtered(db, workspace, path_prefix, Some(struct_kinds))?;
+
+    // Build token → symbol indices map
+    let mut token_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, sym) in all_syms.iter().enumerate() {
+        for token in tokenize_name(&sym.name) {
+            token_to_indices.entry(token).or_default().push(idx);
+        }
+    }
+
+    // Build groups, filter by min_size
+    let mut groups: Vec<TokenGroupInfo> = Vec::new();
+    for (token, indices) in &token_to_indices {
+        if indices.len() < min_size {
+            continue;
+        }
+        let mut kinds: HashMap<String, usize> = HashMap::new();
+        let mut field_sum: u64 = 0;
+        let mut field_count_n: u64 = 0;
+        let mut total_type_use: u64 = 0;
+        let mut names: Vec<String> = Vec::new();
+
+        for &idx in indices {
+            let sym = &all_syms[idx];
+            *kinds.entry(sym.kind.to_string()).or_insert(0) += 1;
+            if let Some(fc) = sym.field_count {
+                field_sum += fc as u64;
+                field_count_n += 1;
+            }
+            total_type_use += sym.type_use_count as u64;
+            names.push(sym.name.clone());
+        }
+        names.sort();
+        let field_count_avg = if field_count_n > 0 {
+            (field_sum as f64 / field_count_n as f64 * 100.0).round() / 100.0
+        } else {
+            0.0
+        };
+
+        groups.push(TokenGroupInfo {
+            token: token.clone(),
+            size: indices.len(),
+            kinds,
+            field_count_avg,
+            total_type_use,
+            names,
+        });
+    }
+
+    groups.sort_by(|a, b| b.size.cmp(&a.size).then(a.token.cmp(&b.token)));
+
+    // Find candidate pairs: groups with similar profiles but no shared members
+    // Profile: [struct%, enum%, trait%, alias%, field_count_avg_norm]
+    fn group_profile(g: &TokenGroupInfo) -> [f64; 4] {
+        let total = g.size as f64;
+        if total == 0.0 {
+            return [0.0; 4];
+        }
+        let structs = *g.kinds.get("struct").unwrap_or(&0) as f64 / total;
+        let enums = *g.kinds.get("enum").unwrap_or(&0) as f64 / total;
+        let traits = *g.kinds.get("trait").unwrap_or(&0) as f64 / total;
+        let aliases = *g.kinds.get("type_alias").unwrap_or(&0) as f64 / total;
+        [structs, enums, traits, aliases]
+    }
+
+    fn cosine_sim(a: &[f64; 4], b: &[f64; 4]) -> f64 {
+        let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let nb: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            return 0.0;
+        }
+        (dot / (na * nb)).clamp(0.0, 1.0)
+    }
+
+    let mut candidate_pairs: Vec<TokenCandidatePair> = Vec::new();
+    for i in 0..groups.len() {
+        for j in (i + 1)..groups.len() {
+            let a = &groups[i];
+            let b = &groups[j];
+
+            // No shared members check
+            let names_a: HashSet<&str> = a.names.iter().map(|s| s.as_str()).collect();
+            let names_b: HashSet<&str> = b.names.iter().map(|s| s.as_str()).collect();
+            if !names_a.is_disjoint(&names_b) {
+                continue; // groups overlap — not parallel
+            }
+
+            let pa = group_profile(a);
+            let pb = group_profile(b);
+            let score = cosine_sim(&pa, &pb);
+
+            if score >= 0.7 && a.size >= min_size && b.size >= min_size {
+                let rationale = format!(
+                    "both groups dominated by {}/{}/{}/{}, sizes {}/{}, no shared members",
+                    a.kinds.get("struct").copied().unwrap_or(0),
+                    a.kinds.get("enum").copied().unwrap_or(0),
+                    b.kinds.get("struct").copied().unwrap_or(0),
+                    b.kinds.get("enum").copied().unwrap_or(0),
+                    a.size,
+                    b.size,
+                );
+                candidate_pairs.push(TokenCandidatePair {
+                    group_a: a.token.clone(),
+                    group_b: b.token.clone(),
+                    similarity_score: (score * 1000.0).round() / 1000.0,
+                    size_a: a.size,
+                    size_b: b.size,
+                    rationale,
+                });
+            }
+        }
+    }
+
+    candidate_pairs.sort_by(|a, b| b.similarity_score.partial_cmp(&a.similarity_score).unwrap_or(std::cmp::Ordering::Equal));
+
+    let resp = ParallelSystemsTokenResponse { groups, candidate_pairs };
     Ok(Json(serde_json::json!(resp)))
 }
 
@@ -671,6 +833,8 @@ struct OrphansQuery {
     workspace: String,
     path_prefix: Option<String>,
     kind: Option<String>,
+    /// When true (default), pub_use_decl edges don't count as real usage.
+    exclude_pub_use: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -693,11 +857,13 @@ async fn orphans(
     Query(params): Query<OrphansQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let exclude_pub_use = params.exclude_pub_use.unwrap_or(true);
     let symbols = reader::get_orphan_types(
         &db,
         &params.workspace,
         params.path_prefix.as_deref(),
         params.kind.as_deref(),
+        exclude_pub_use,
     )?;
 
     let total = symbols.len();
@@ -713,6 +879,269 @@ async fn orphans(
         .collect();
 
     let resp = OrphansResponse { total, orphans: orphans_list };
+    Ok(Json(serde_json::json!(resp)))
+}
+
+// ---------------------------------------------------------------------------
+// /ast/role_groups — group types by shared name tokens
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RoleGroupsQuery {
+    workspace: String,
+    path_prefix: Option<String>,
+    token: Option<String>,
+    min_size: Option<usize>,
+    kind: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RoleGroupMember {
+    name: String,
+    kind: String,
+    file: String,
+    line: u32,
+    field_count: Option<u32>,
+    type_use_count: u32,
+    tokens: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RoleGroup {
+    token: String,
+    size: usize,
+    members: Vec<RoleGroupMember>,
+}
+
+#[derive(Serialize)]
+struct RoleGroupsResponse {
+    groups: Vec<RoleGroup>,
+}
+
+async fn role_groups(
+    State(state): State<SharedState>,
+    Query(params): Query<RoleGroupsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let min_size = params.min_size.unwrap_or(3);
+    let workspace = &params.workspace;
+
+    let kind_filter: &[&str] = &["struct", "enum", "trait", "type_alias"];
+    let all_syms = reader::get_all_symbols_filtered(
+        &db,
+        workspace,
+        params.path_prefix.as_deref(),
+        Some(kind_filter),
+    )?;
+
+    // Optionally filter by kind
+    let filtered: Vec<&crate::types::Symbol> = if let Some(ref k) = params.kind {
+        all_syms.iter().filter(|s| s.kind.to_string() == *k).collect()
+    } else {
+        all_syms.iter().collect()
+    };
+
+    // Build token → members map
+    let mut token_map: HashMap<String, Vec<RoleGroupMember>> = HashMap::new();
+
+    for sym in &filtered {
+        let tokens = tokenize_name(&sym.name);
+        for token in &tokens {
+            // If specific token requested, only include matching
+            if let Some(ref requested) = params.token {
+                if token != requested {
+                    continue;
+                }
+            }
+            token_map.entry(token.clone()).or_default().push(RoleGroupMember {
+                name: sym.name.clone(),
+                kind: sym.kind.to_string(),
+                file: sym.file_path.clone(),
+                line: sym.line,
+                field_count: sym.field_count,
+                type_use_count: sym.type_use_count,
+                tokens: tokens.clone(),
+            });
+        }
+    }
+
+    // Build groups, filter by min_size, sort members by type_use_count desc
+    let mut groups: Vec<RoleGroup> = token_map
+        .into_iter()
+        .filter(|(_, members)| members.len() >= min_size)
+        .map(|(token, mut members)| {
+            members.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
+            let size = members.len();
+            RoleGroup { token, size, members }
+        })
+        .collect();
+
+    // Sort groups by size desc
+    groups.sort_by(|a, b| b.size.cmp(&a.size).then(a.token.cmp(&b.token)));
+
+    let resp = RoleGroupsResponse { groups };
+    Ok(Json(serde_json::json!(resp)))
+}
+
+// ---------------------------------------------------------------------------
+// /ast/find_twins — find types similar to a seed by multiple heuristics
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct FindTwinsQuery {
+    seed: String,
+    workspace: String,
+    path_prefix: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TwinEntry {
+    name: String,
+    kind: String,
+    file: String,
+    line: u32,
+    field_count: Option<u32>,
+    type_use_count: u32,
+}
+
+#[derive(Serialize)]
+struct SharedTokenTwin {
+    name: String,
+    kind: String,
+    file: String,
+    line: u32,
+    field_count: Option<u32>,
+    type_use_count: u32,
+    shared_tokens: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct FindTwinsResponse {
+    seed: String,
+    twins: FindTwinsDetail,
+}
+
+#[derive(Serialize)]
+struct FindTwinsDetail {
+    exact_shape: Vec<TwinEntry>,
+    loose_shape: Vec<TwinEntry>,
+    shared_token: Vec<SharedTokenTwin>,
+    similar_size: Vec<TwinEntry>,
+}
+
+async fn find_twins(
+    State(state): State<SharedState>,
+    Query(params): Query<FindTwinsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let workspace = &params.workspace;
+
+    // Load the seed symbol(s)
+    let kind_filter: &[&str] = &["struct", "enum", "trait", "type_alias"];
+    let all_syms = reader::get_all_symbols_filtered(
+        &db,
+        workspace,
+        params.path_prefix.as_deref(),
+        Some(kind_filter),
+    )?;
+
+    // Find seed
+    let seed_syms: Vec<&crate::types::Symbol> = all_syms
+        .iter()
+        .filter(|s| s.name == params.seed)
+        .collect();
+
+    if seed_syms.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "error": format!("seed '{}' not found", params.seed)
+        })));
+    }
+
+    let seed = seed_syms[0];
+    let seed_tokens: std::collections::HashSet<String> =
+        tokenize_name(&seed.name).into_iter().collect();
+    let seed_field_count = seed.field_count.unwrap_or(0);
+    let seed_kind = seed.kind.to_string();
+
+    let mut exact_shape: Vec<TwinEntry> = Vec::new();
+    let mut loose_shape: Vec<TwinEntry> = Vec::new();
+    let mut shared_token: Vec<SharedTokenTwin> = Vec::new();
+    let mut similar_size: Vec<TwinEntry> = Vec::new();
+
+    for sym in &all_syms {
+        if sym.name == params.seed {
+            continue;
+        }
+
+        let sym_kind = sym.kind.to_string();
+        let to_entry = || TwinEntry {
+            name: sym.name.clone(),
+            kind: sym_kind.clone(),
+            file: sym.file_path.clone(),
+            line: sym.line,
+            field_count: sym.field_count,
+            type_use_count: sym.type_use_count,
+        };
+
+        // a) Exact shape fingerprint
+        if let (Some(a), Some(b)) = (&seed.shape_fingerprint, &sym.shape_fingerprint) {
+            if a == b {
+                exact_shape.push(to_entry());
+                continue;
+            }
+        }
+
+        // b) Loose shape fingerprint
+        if let (Some(a), Some(b)) = (&seed.shape_fingerprint_loose, &sym.shape_fingerprint_loose) {
+            if a == b && sym_kind == seed_kind {
+                loose_shape.push(to_entry());
+                continue;
+            }
+        }
+
+        // c) Shared name tokens
+        let sym_tokens: std::collections::HashSet<String> =
+            tokenize_name(&sym.name).into_iter().collect();
+        let shared: Vec<String> = seed_tokens.intersection(&sym_tokens).cloned().collect();
+        if !shared.is_empty() {
+            let mut shared_sorted = shared;
+            shared_sorted.sort();
+            shared_token.push(SharedTokenTwin {
+                name: sym.name.clone(),
+                kind: sym_kind.clone(),
+                file: sym.file_path.clone(),
+                line: sym.line,
+                field_count: sym.field_count,
+                type_use_count: sym.type_use_count,
+                shared_tokens: shared_sorted,
+            });
+            continue;
+        }
+
+        // d) Similar field/method count ±1, same kind
+        if sym_kind == seed_kind {
+            let sym_fc = sym.field_count.unwrap_or(0);
+            if sym_fc.abs_diff(seed_field_count) <= 1 {
+                similar_size.push(to_entry());
+            }
+        }
+    }
+
+    // Sort all by type_use_count desc
+    exact_shape.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count));
+    loose_shape.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count));
+    shared_token.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
+    similar_size.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
+
+    let resp = FindTwinsResponse {
+        seed: params.seed,
+        twins: FindTwinsDetail {
+            exact_shape,
+            loose_shape,
+            shared_token,
+            similar_size,
+        },
+    };
     Ok(Json(serde_json::json!(resp)))
 }
 

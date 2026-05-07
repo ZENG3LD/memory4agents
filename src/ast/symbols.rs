@@ -389,6 +389,20 @@ pub fn extract_use_decl_type_uses(
     uses
 }
 
+fn is_pub_use(node: tree_sitter::Node<'_>, src: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            let text = child.utf8_text(src).unwrap_or("");
+            // `pub`, `pub(crate)`, `pub(super)` — all are re-exports
+            if text.starts_with("pub") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn collect_use_decls(
     node: tree_sitter::Node<'_>,
     src: &[u8],
@@ -396,13 +410,18 @@ fn collect_use_decls(
     out: &mut Vec<PendingTypeUse>,
 ) {
     if node.kind() == "use_declaration" {
+        let use_kind: &'static str = if is_pub_use(node, src) {
+            "pub_use_decl"
+        } else {
+            "use_decl"
+        };
         let names = extract_use_decl_names(node, src);
         for to_name in names {
             out.push(PendingTypeUse {
                 from_name: anchor.name.clone(),
                 from_line: anchor.line,
                 to_name,
-                use_kind: "use_decl",
+                use_kind,
             });
         }
         // Don't recurse further into use_declaration (already handled inside extract_use_decl_names)

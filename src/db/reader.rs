@@ -1009,8 +1009,12 @@ pub fn get_dead_types(
 }
 
 /// Get true orphan symbols: type_use_count=0 AND callsite_count=0 AND
-/// the symbol name does not appear as a `to_symbol_id` in type_use_edges at all
-/// (i.e. nobody imports it via use_decl or uses it in any body).
+/// the symbol name does not appear as a meaningful `to_symbol_id` in type_use_edges.
+///
+/// When `exclude_pub_use` is true (the default), `pub_use_decl` edges are NOT
+/// counted as real usage — only `field`, `param`, `return`, `body`, `use_decl`,
+/// `generic`, `bound` edges count.  This prevents re-exported types from being
+/// incorrectly labelled as orphans.
 ///
 /// Stricter than `get_dead_types` which only checks the denormalised counts.
 pub fn get_orphan_types(
@@ -1018,13 +1022,20 @@ pub fn get_orphan_types(
     workspace_id: &str,
     path_prefix: Option<&str>,
     kind: Option<&str>,
+    exclude_pub_use: bool,
 ) -> Result<Vec<Symbol>, CoreError> {
+    let not_exists_clause = if exclude_pub_use {
+        // Only edges that are NOT pub_use_decl count as real usage.
+        "NOT EXISTS (SELECT 1 FROM type_use_edges e WHERE e.workspace_id = s.workspace_id AND e.to_symbol_id = s.id AND e.use_kind != 'pub_use_decl')".to_owned()
+    } else {
+        "NOT EXISTS (SELECT 1 FROM type_use_edges e WHERE e.workspace_id = s.workspace_id AND e.to_symbol_id = s.id)".to_owned()
+    };
+
     let mut conditions: Vec<String> = vec![
         "s.workspace_id = ?1".to_owned(),
         "s.type_use_count = 0".to_owned(),
         "s.callsite_count = 0".to_owned(),
-        // Also not referenced by any type_use_edge (catches use_decl self-references, etc.)
-        "NOT EXISTS (SELECT 1 FROM type_use_edges e WHERE e.workspace_id = s.workspace_id AND e.to_symbol_id = s.id)".to_owned(),
+        not_exists_clause,
     ];
     let mut param_idx = 2usize;
     if path_prefix.is_some() {

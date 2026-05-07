@@ -1,3 +1,84 @@
+/// Stop-words filtered from name tokens (too generic to be meaningful).
+const TOKEN_STOP_WORDS: &[&str] = &[
+    "with", "for", "into", "from", "as", "the", "and", "or", "not", "new", "get", "set",
+    "is", "to", "of", "in", "on", "at", "by",
+];
+
+/// Split a PascalCase / snake_case identifier into lowercase tokens.
+///
+/// Rules:
+/// - CamelCase boundary: lowercase-to-uppercase transition (`KeyCode` → `["key","code"]`)
+/// - snake_case: split on `_`
+/// - Digits treated as boundaries (`Route3` → `["route", "3"]`)
+/// - Tokens shorter than 2 chars are dropped.
+/// - Stop-words are filtered.
+/// - Result is deduplicated while preserving order.
+///
+/// Examples:
+/// - `ChromeTheme` → `["chrome", "theme"]`
+/// - `KeyCode` → `["key", "code"]`
+/// - `AnimatedValue` → `["animated", "value"]`
+/// - `my_widget_state` → `["my", "widget", "state"]`
+pub fn tokenize_name(name: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    let chars: Vec<char> = name.chars().collect();
+    let len = chars.len();
+
+    for i in 0..len {
+        let ch = chars[i];
+        if ch == '_' {
+            if !current.is_empty() {
+                flush_token(&mut current, &mut tokens);
+            }
+        } else if ch.is_ascii_digit() {
+            if !current.is_empty() {
+                flush_token(&mut current, &mut tokens);
+            }
+            // digits as their own token
+            current.push(ch);
+            flush_token(&mut current, &mut tokens);
+        } else if ch.is_ascii_uppercase() {
+            // Start of a new CamelCase word: flush previous
+            if !current.is_empty() {
+                // Peek: if next char is lowercase, this is start of new word
+                // E.g. "HTML" stays as one token "html", but "HTMLWidget" splits to ["html","widget"]
+                let next_is_lower = i + 1 < len && chars[i + 1].is_ascii_lowercase();
+                let prev_was_upper = i > 0 && chars[i - 1].is_ascii_uppercase();
+                if next_is_lower && prev_was_upper {
+                    // "HTMLWidget" — flush "html" before "W"
+                    flush_token(&mut current, &mut tokens);
+                } else if !prev_was_upper {
+                    // Normal transition from lower to upper
+                    flush_token(&mut current, &mut tokens);
+                }
+            }
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            current.push(ch.to_ascii_lowercase());
+        }
+    }
+    if !current.is_empty() {
+        flush_token(&mut current, &mut tokens);
+    }
+
+    // Filter stop words and short tokens, deduplicate preserving order
+    let mut seen = std::collections::HashSet::new();
+    tokens
+        .into_iter()
+        .filter(|t| t.len() >= 2 && !TOKEN_STOP_WORDS.contains(&t.as_str()))
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
+}
+
+fn flush_token(current: &mut String, tokens: &mut Vec<String>) {
+    if !current.is_empty() {
+        tokens.push(current.clone());
+        current.clear();
+    }
+}
+
 /// Returns true if the identifier is a well-known external type that should be
 /// excluded from use-graph edges (std / core / common library types, primitives,
 /// traits, and common framework types that pollute the graph without carrying

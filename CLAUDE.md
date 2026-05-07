@@ -49,14 +49,22 @@ curl -X POST "http://127.0.0.1:18200/index" \
 | `/ast/type_usage?name=NAME&workspace=ID&path_prefix=P&breakdown=true` | Who uses NAME as a type: per-definition member list + users from type_use_edges. `breakdown=true` adds `users_by_kind` map (field/param/return/body/use_decl counts). |
 | `/ast/dead_types?workspace=ID&path_prefix=P&kind=struct` | All symbols with `type_use_count=0 AND callsite_count=0` (dead candidates; includes signature+body+use_decl edges). |
 | `/ast/usage_hotspots?workspace=ID&path_prefix=P&top=N` | Top-N types by `type_use_count` desc (most used as types across workspace). |
-| `/ast/orphans?workspace=ID&path_prefix=P&kind=struct` | Strict dead: `type_use_count=0 AND callsite_count=0` AND no `type_use_edges` row targeting this symbol (neither signature, body, nor use_decl). These are genuine orphans. |
+| `/ast/orphans?workspace=ID&path_prefix=P&kind=struct&exclude_pub_use=true` | Strict dead: `type_use_count=0 AND callsite_count=0` AND no meaningful `type_use_edges` row. `exclude_pub_use=true` (default) means `pub_use_decl` re-exports don't count as real usage. |
+| `/ast/role_groups?workspace=ID&path_prefix=P&token=theme&min_size=3&kind=trait` | Group types by shared name tokens. `token` (optional): only return group for that token. `min_size` (optional, default 3). `kind` (optional). Returns groups sorted by size desc, members sorted by `type_use_count` desc. |
+| `/ast/find_twins?seed=NAME&workspace=ID&path_prefix=P` | Find types similar to seed by 4 heuristics: `exact_shape` (same strict fingerprint), `loose_shape` (same loose fingerprint, same kind), `shared_token` (overlapping name tokens, includes `shared_tokens` list), `similar_size` (same kind, field_count ±1). |
+| `/ast/parallel_systems?workspace=ID&path_prefix=P&min_size=N&mode=wcc` | `mode=wcc` (default): weakly-connected components of structural type graph + `parallel_candidates` by euclidean profile distance. `mode=token`: profile-clustering by semantic name tokens — `groups` + `candidate_pairs` with cosine similarity ≥ 0.7 and no shared members. |
 | `/health` | Server status + index stats |
 
-## type_use_count sources (v0.2.7+)
+## type_use_count sources (v0.2.8+)
 
-`type_use_count` now counts edges from three sources:
+`type_use_count` counts edges from four sources:
 - **signature** — struct fields, fn params/return (`field`, `param`, `return`, `generic`)
-- **body** — PascalCase type names inside function/method bodies (let-bindings, turbofish, struct literals, casts) — `use_kind = "body"`
-- **use_decl** — `use crate::foo::Bar;` import statements — `use_kind = "use_decl"`
+- **body** — PascalCase type names inside function/method bodies — `use_kind = "body"`
+- **use_decl** — `use crate::foo::Bar;` private import — `use_kind = "use_decl"`
+- **pub_use_decl** — `pub use crate::foo::Bar;` re-export — `use_kind = "pub_use_decl"`
 
-This eliminates most false-positive dead-type reports from `/ast/dead_types`.
+`/ast/orphans` with `exclude_pub_use=true` (default) treats `pub_use_decl` as non-usage, so re-exported types are not falsely marked as orphans.
+
+## name token stop-words (tokenize_name)
+
+`with`, `for`, `into`, `from`, `as`, `the`, `and`, `or`, `not`, `new`, `get`, `set`, `is`, `to`, `of`, `in`, `on`, `at`, `by`. Tokens < 2 chars also dropped.
