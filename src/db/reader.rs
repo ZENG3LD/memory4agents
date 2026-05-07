@@ -1008,6 +1008,62 @@ pub fn get_dead_types(
     Ok(result)
 }
 
+/// Get true orphan symbols: type_use_count=0 AND callsite_count=0 AND
+/// the symbol name does not appear as a `to_symbol_id` in type_use_edges at all
+/// (i.e. nobody imports it via use_decl or uses it in any body).
+///
+/// Stricter than `get_dead_types` which only checks the denormalised counts.
+pub fn get_orphan_types(
+    conn: &Connection,
+    workspace_id: &str,
+    path_prefix: Option<&str>,
+    kind: Option<&str>,
+) -> Result<Vec<Symbol>, CoreError> {
+    let mut conditions: Vec<String> = vec![
+        "s.workspace_id = ?1".to_owned(),
+        "s.type_use_count = 0".to_owned(),
+        "s.callsite_count = 0".to_owned(),
+        // Also not referenced by any type_use_edge (catches use_decl self-references, etc.)
+        "NOT EXISTS (SELECT 1 FROM type_use_edges e WHERE e.workspace_id = s.workspace_id AND e.to_symbol_id = s.id)".to_owned(),
+    ];
+    let mut param_idx = 2usize;
+    if path_prefix.is_some() {
+        conditions.push(format!("s.file_path LIKE ?{param_idx}"));
+        param_idx += 1;
+    }
+    if kind.is_some() {
+        conditions.push(format!("s.kind = ?{param_idx}"));
+    }
+
+    let sql = format!(
+        "SELECT s.id, s.workspace_id, s.file_path, s.name, s.kind, s.visibility, s.line, s.col, s.parent_name, s.signature, s.body_hash, s.shape_fingerprint, s.shape_fingerprint_loose, s.field_count, s.shape_summary, s.callsite_count, s.type_use_count FROM symbols s WHERE {} ORDER BY s.name",
+        conditions.join(" AND ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    param_values.push(Box::new(workspace_id.to_owned()));
+    if let Some(prefix) = path_prefix {
+        param_values.push(Box::new(format!("{prefix}%")));
+    }
+    if let Some(k) = kind {
+        param_values.push(Box::new(k.to_owned()));
+    }
+
+    let refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+    let result: Vec<Symbol> = stmt
+        .query_map(refs.as_slice(), row_to_symbol)?
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("[dig2memory] orphan_types row error: {e}");
+                None
+            }
+        })
+        .collect();
+    Ok(result)
+}
+
 /// Get top-N symbols by type_use_count (usage hotspots).
 pub fn get_usage_hotspots(
     conn: &Connection,

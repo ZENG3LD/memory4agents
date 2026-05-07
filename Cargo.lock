@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "dig2memory"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "axum",
  "cargo_metadata",

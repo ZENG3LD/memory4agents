@@ -19,6 +19,7 @@ pub fn router() -> Router<SharedState> {
         .route("/ast/type_usage", get(type_usage))
         .route("/ast/dead_types", get(dead_types))
         .route("/ast/usage_hotspots", get(usage_hotspots))
+        .route("/ast/orphans", get(orphans))
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +471,7 @@ struct TypeUsageQuery {
     name: String,
     workspace: String,
     path_prefix: Option<String>,
+    breakdown: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -490,6 +492,8 @@ struct TypeUsageMember {
     type_use_count: u32,
     callsite_count: u32,
     users: Vec<TypeUserEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    users_by_kind: Option<HashMap<String, usize>>,
 }
 
 #[derive(Serialize)]
@@ -510,9 +514,19 @@ async fn type_usage(
         params.path_prefix.as_deref(),
     )?;
 
+    let want_breakdown = params.breakdown.unwrap_or(false);
     let mut members: Vec<TypeUsageMember> = Vec::new();
     for sym in symbols {
         let users_raw = reader::get_type_users(&db, &params.workspace, sym.id)?;
+        let users_by_kind: Option<HashMap<String, usize>> = if want_breakdown {
+            let mut map: HashMap<String, usize> = HashMap::new();
+            for u in &users_raw {
+                *map.entry(u.use_kind.clone()).or_insert(0) += 1;
+            }
+            Some(map)
+        } else {
+            None
+        };
         let users: Vec<TypeUserEntry> = users_raw
             .into_iter()
             .map(|u| TypeUserEntry {
@@ -531,6 +545,7 @@ async fn type_usage(
             type_use_count: sym.type_use_count,
             callsite_count: sym.callsite_count,
             users,
+            users_by_kind,
         });
     }
 
@@ -644,6 +659,60 @@ async fn usage_hotspots(
         .collect();
 
     let resp = UsageHotspotsResponse { hotspots };
+    Ok(Json(serde_json::json!(resp)))
+}
+
+// ---------------------------------------------------------------------------
+// /ast/orphans
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct OrphansQuery {
+    workspace: String,
+    path_prefix: Option<String>,
+    kind: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OrphanEntry {
+    name: String,
+    kind: String,
+    file: String,
+    line: u32,
+    field_count: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct OrphansResponse {
+    total: usize,
+    orphans: Vec<OrphanEntry>,
+}
+
+async fn orphans(
+    State(state): State<SharedState>,
+    Query(params): Query<OrphansQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let symbols = reader::get_orphan_types(
+        &db,
+        &params.workspace,
+        params.path_prefix.as_deref(),
+        params.kind.as_deref(),
+    )?;
+
+    let total = symbols.len();
+    let orphans_list: Vec<OrphanEntry> = symbols
+        .into_iter()
+        .map(|s| OrphanEntry {
+            name: s.name,
+            kind: s.kind.to_string(),
+            file: s.file_path,
+            line: s.line,
+            field_count: s.field_count,
+        })
+        .collect();
+
+    let resp = OrphansResponse { total, orphans: orphans_list };
     Ok(Json(serde_json::json!(resp)))
 }
 

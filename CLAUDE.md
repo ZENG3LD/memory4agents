@@ -46,7 +46,17 @@ curl -X POST "http://127.0.0.1:18200/index" \
 | `/ast/cluster?seed=NAME&workspace=ID&depth=N&path_prefix=P&include_dead=true` | BFS use-graph around seed type: nodes + edges to depth N (default 2, max 4). Each node has `callsite_count`. Edges: `uses` (type appears in signature) or `uses` (caller). |
 | `/ast/parallel_systems?workspace=ID&path_prefix=P&min_size=N` | Find weakly-connected components of the structural type graph (size >= min_size, default 5). Returns components + `parallel_candidates` pairs with `profile_distance` < 0.2 (euclidean over struct%/enum%/trait%/alias%/dead%). |
 | `/ast/dead_in_group?fingerprint=HASH&workspace=ID` | All symbols sharing a shape fingerprint, each with `callsite_count` and `is_dead` flag. |
-| `/ast/type_usage?name=NAME&workspace=ID&path_prefix=P` | Who uses NAME as a type: per-definition member list + users from type_use_edges. |
-| `/ast/dead_types?workspace=ID&path_prefix=P&kind=struct` | All symbols with `type_use_count=0 AND callsite_count=0` (honest dead candidates). |
+| `/ast/type_usage?name=NAME&workspace=ID&path_prefix=P&breakdown=true` | Who uses NAME as a type: per-definition member list + users from type_use_edges. `breakdown=true` adds `users_by_kind` map (field/param/return/body/use_decl counts). |
+| `/ast/dead_types?workspace=ID&path_prefix=P&kind=struct` | All symbols with `type_use_count=0 AND callsite_count=0` (dead candidates; includes signature+body+use_decl edges). |
 | `/ast/usage_hotspots?workspace=ID&path_prefix=P&top=N` | Top-N types by `type_use_count` desc (most used as types across workspace). |
+| `/ast/orphans?workspace=ID&path_prefix=P&kind=struct` | Strict dead: `type_use_count=0 AND callsite_count=0` AND no `type_use_edges` row targeting this symbol (neither signature, body, nor use_decl). These are genuine orphans. |
 | `/health` | Server status + index stats |
+
+## type_use_count sources (v0.2.7+)
+
+`type_use_count` now counts edges from three sources:
+- **signature** — struct fields, fn params/return (`field`, `param`, `return`, `generic`)
+- **body** — PascalCase type names inside function/method bodies (let-bindings, turbofish, struct literals, casts) — `use_kind = "body"`
+- **use_decl** — `use crate::foo::Bar;` import statements — `use_kind = "use_decl"`
+
+This eliminates most false-positive dead-type reports from `/ast/dead_types`.

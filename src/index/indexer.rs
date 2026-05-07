@@ -127,7 +127,16 @@ impl Indexer {
                 };
 
                 let symbols = lang.extract_symbols(&tree, &src, workspace_id, rel_path);
-                let pending_type_uses = sym_extractor::extract_type_uses(&symbols);
+                let mut pending_type_uses = sym_extractor::extract_type_uses(&symbols);
+                // Also extract body uses and use_decl uses for Rust files.
+                if rel_path.ends_with(".rs") {
+                    pending_type_uses.extend(
+                        sym_extractor::extract_body_type_uses(&tree, &src, &symbols),
+                    );
+                    pending_type_uses.extend(
+                        sym_extractor::extract_use_decl_type_uses(&tree, &src, &symbols),
+                    );
+                }
                 let calls = lang.extract_calls(&tree, &src, rel_path, &symbols);
                 let file_edges =
                     lang.extract_file_edges(&tree, &src, workspace_id, rel_path, &req.root_path);
