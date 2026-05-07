@@ -85,6 +85,13 @@ fn collect_symbols(
                     col: pos.column as u32,
                     parent_name: parent_class.map(str::to_owned),
                     signature: None,
+                    body_hash: None,
+                    shape_fingerprint: None,
+                    shape_fingerprint_loose: None,
+                    field_count: None,
+                    shape_summary: None,
+                    callsite_count: 0,
+                    type_use_count: 0,
                 });
             }
         }
@@ -103,6 +110,13 @@ fn collect_symbols(
                     col: pos.column as u32,
                     parent_name: parent_class.map(str::to_owned),
                     signature: None,
+                    body_hash: None,
+                    shape_fingerprint: None,
+                    shape_fingerprint_loose: None,
+                    field_count: None,
+                    shape_summary: None,
+                    callsite_count: 0,
+                    type_use_count: 0,
                 });
                 // Walk class body with class name as parent.
                 if let Some(body) = node.child_by_field_name("body") {
@@ -145,6 +159,13 @@ fn collect_symbols(
                                     col: pos.column as u32,
                                     parent_name: None,
                                     signature: None,
+                                    body_hash: None,
+                                    shape_fingerprint: None,
+                                    shape_fingerprint_loose: None,
+                                    field_count: None,
+                                    shape_summary: None,
+                                    callsite_count: 0,
+                    type_use_count: 0,
                                 });
                             }
                         }

@@ -101,7 +101,7 @@ fn load_symbol_by_id(
     let result = match workspace_id {
         Some(ws) => {
             let mut stmt = conn.prepare(
-                "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature
+                "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
                  FROM symbols WHERE id = ?1 AND workspace_id = ?2",
             )?;
             let x = stmt
@@ -112,7 +112,7 @@ fn load_symbol_by_id(
         }
         None => {
             let mut stmt = conn.prepare(
-                "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature
+                "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
                  FROM symbols WHERE id = ?1",
             )?;
             let x = stmt
@@ -145,6 +145,13 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         col: row.get(7)?,
         parent_name: row.get(8)?,
         signature: row.get(9)?,
+        body_hash: row.get(10)?,
+        shape_fingerprint: row.get(11).unwrap_or(None),
+        shape_fingerprint_loose: row.get(12).unwrap_or(None),
+        field_count: row.get::<_, Option<i64>>(13).unwrap_or(None).map(|v| v as u32),
+        shape_summary: row.get(14).unwrap_or(None),
+        callsite_count: row.get::<_, Option<i64>>(15).unwrap_or(None).map(|v| v as u32).unwrap_or(0),
+        type_use_count: row.get::<_, Option<i64>>(16).unwrap_or(None).map(|v| v as u32).unwrap_or(0),
     })
 }
 

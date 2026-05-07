@@ -6,9 +6,9 @@
 
 When indexing the TypeScript-heavy workspace:
 
-- workspace root: `Z:\sandbox\claude-code-leaked`
-- workspace id: `claude-code-leaked`
-- DB: `C:\Users\VA PC\CODING\ML_TRADING\nemo\dig2memory\data-sandbox-ts\index.db`
+- workspace root: `.\sandbox-ts`
+- workspace id: `sample-ts`
+- DB: `dig2memory\data-sandbox-ts\index.db`
 
 the AST/symbol index works, but graph queries are partially broken because
 TypeScript file edges are stored with non-normalized paths like:
@@ -24,16 +24,16 @@ instead of:
 These queries were run with:
 
 - binary:
-  `C:\Users\VA PC\CODING\ML_TRADING\nemo\dig2memory\target-ts\release\dig2memory.exe`
+  `dig2memory\target-ts\release\dig2memory.exe`
 - DB:
-  `C:\Users\VA PC\CODING\ML_TRADING\nemo\dig2memory\data-sandbox-ts\index.db`
+  `dig2memory\data-sandbox-ts\index.db`
 - workspace:
-  `claude-code-leaked`
+  `sample-ts`
 
 Working query:
 
 ```powershell
-dig2memory.exe --db ... --workspace claude-code-leaked --json deps "src/tools.ts"
+dig2memory.exe --db ... --workspace sample-ts --json deps "src/tools.ts"
 ```
 
 It returns edges like:
@@ -44,7 +44,7 @@ It returns edges like:
 Broken query:
 
 ```powershell
-dig2memory.exe --db ... --workspace claude-code-leaked --json impact "src/Tool.ts"
+dig2memory.exe --db ... --workspace sample-ts --json impact "src/Tool.ts"
 ```
 
 It returns:
@@ -56,7 +56,7 @@ It returns:
 But this works:
 
 ```powershell
-dig2memory.exe --db ... --workspace claude-code-leaked --json impact "src/./Tool.ts"
+dig2memory.exe --db ... --workspace sample-ts --json impact "src/./Tool.ts"
 ```
 
 It returns reverse deps such as:
@@ -88,7 +88,7 @@ Especially around import resolution and emitted `file_edges`.
 
 ### Why this matters
 
-For TS codebases like `claude-code-leaked`, `dig2memory` is still useful for:
+For TS codebases like `sample-ts`, `dig2memory` is still useful for:
 
 - symbols
 - symbol search

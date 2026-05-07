@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     col             INTEGER NOT NULL,
     parent_name     TEXT,
     signature       TEXT,
+    body_hash       TEXT,
     FOREIGN KEY (workspace_id, file_path) REFERENCES file_records(workspace_id, file_path) ON DELETE CASCADE
 );
 
@@ -91,5 +92,39 @@ CREATE TABLE IF NOT EXISTS crate_dep_edges (
 /// Initialize the database schema (idempotent).
 pub fn init_schema(conn: &rusqlite::Connection) -> Result<(), CoreError> {
     conn.execute_batch(SCHEMA_SQL)?;
+    // Migration: add body_hash column if it doesn't exist yet (existing DBs).
+    let _ = conn.execute_batch("ALTER TABLE symbols ADD COLUMN body_hash TEXT;");
+    // Migration: add shape_fingerprint column if it doesn't exist yet.
+    let _ = conn.execute_batch("ALTER TABLE symbols ADD COLUMN shape_fingerprint TEXT;");
+    let _ = conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_symbols_fingerprint ON symbols(shape_fingerprint);",
+    );
+    // Migration v0.2.4: loose fingerprint, field count, shape summary.
+    let _ = conn.execute_batch("ALTER TABLE symbols ADD COLUMN shape_fingerprint_loose TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE symbols ADD COLUMN field_count INTEGER;");
+    let _ = conn.execute_batch("ALTER TABLE symbols ADD COLUMN shape_summary TEXT;");
+    let _ = conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_symbols_fingerprint_loose ON symbols(shape_fingerprint_loose);",
+    );
+    // Migration v0.2.5: callsite_count (updated at end of index pass).
+    let _ = conn.execute_batch(
+        "ALTER TABLE symbols ADD COLUMN callsite_count INTEGER NOT NULL DEFAULT 0;",
+    );
+    // Migration v0.2.6: type_use_count (in-degree from type_use_edges).
+    let _ = conn.execute_batch(
+        "ALTER TABLE symbols ADD COLUMN type_use_count INTEGER NOT NULL DEFAULT 0;",
+    );
+    // Migration v0.2.6: type_use_edges table.
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS type_use_edges (
+            workspace_id    TEXT NOT NULL,
+            from_symbol_id  INTEGER NOT NULL,
+            to_symbol_id    INTEGER NOT NULL,
+            use_kind        TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, from_symbol_id, to_symbol_id, use_kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_type_use_from ON type_use_edges(workspace_id, from_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_type_use_to ON type_use_edges(workspace_id, to_symbol_id);",
+    );
     Ok(())
 }

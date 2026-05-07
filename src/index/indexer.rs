@@ -1,9 +1,9 @@
-use crate::ast::registry;
+use crate::ast::{registry, symbols as sym_extractor};
 use crate::db::{reader, writer};
 use crate::error::CoreError;
 use crate::graph::crates::parse_cargo_workspace;
-use crate::types::{CallEdge, FileRecord, IndexRequest, IndexResult, Symbol, SymbolKind, Workspace};
-use std::collections::HashSet;
+use crate::types::{CallEdge, FileRecord, IndexRequest, IndexResult, PendingTypeUse, Symbol, SymbolKind, TypeUseEdge, Workspace};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -54,6 +54,10 @@ impl Indexer {
         let files_to_index: Vec<(PathBuf, String, i64, i64)> = if req.force {
             // Force: wipe existing workspace data first (brief lock).
             let conn = db.lock().map_err(|_| CoreError::LockPoisoned)?;
+            conn.execute(
+                "DELETE FROM type_use_edges WHERE workspace_id = ?1",
+                rusqlite::params![workspace_id],
+            )?;
             conn.execute(
                 "DELETE FROM symbols WHERE workspace_id = ?1",
                 rusqlite::params![workspace_id],
@@ -123,6 +127,7 @@ impl Indexer {
                 };
 
                 let symbols = lang.extract_symbols(&tree, &src, workspace_id, rel_path);
+                let pending_type_uses = sym_extractor::extract_type_uses(&symbols);
                 let calls = lang.extract_calls(&tree, &src, rel_path, &symbols);
                 let file_edges =
                     lang.extract_file_edges(&tree, &src, workspace_id, rel_path, &req.root_path);
@@ -134,13 +139,32 @@ impl Indexer {
                     symbols,
                     calls,
                     file_edges,
+                    pending_type_uses,
                 });
             }
 
             // Write entire batch inside a single brief transaction.
+            // Also collect resolved type-use edges for post-commit insertion.
+            let mut batch_type_uses: Vec<TypeUseEdge> = Vec::new();
+
             {
                 let conn = db.lock().map_err(|_| CoreError::LockPoisoned)?;
                 let tx = conn.unchecked_transaction()?;
+
+                // Build a workspace-wide name→first_id HashMap for type-use resolution.
+                // This is O(symbols_in_workspace) but done once per batch and takes <1ms.
+                let name_to_id: HashMap<String, i64> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT name, MIN(id) FROM symbols WHERE workspace_id = ?1 GROUP BY name",
+                    )?;
+                    let collected: HashMap<String, i64> = stmt
+                        .query_map(rusqlite::params![workspace_id], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        })?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    collected
+                };
 
                 for pf in &parsed_batch {
                     // Delete stale data for this file.
@@ -203,12 +227,42 @@ impl Indexer {
                         }
                     }
 
+                    // Resolve type-use edges using the name→id map.
+                    for pending in &pf.pending_type_uses {
+                        let from_id = resolve_caller_id(&line_to_id, pending.from_line);
+                        if from_id == 0 {
+                            continue; // Could not resolve from_symbol_id.
+                        }
+                        if let Some(&to_id) = name_to_id.get(&pending.to_name) {
+                            if from_id != to_id {
+                                batch_type_uses.push(TypeUseEdge {
+                                    workspace_id: workspace_id.clone(),
+                                    from_symbol_id: from_id,
+                                    to_symbol_id: to_id,
+                                    use_kind: pending.use_kind,
+                                });
+                            }
+                        }
+                    }
+
                     total_symbols += sym_count;
                     files_indexed += 1;
                 }
 
                 tx.commit()?;
             } // mutex released here
+
+            // Insert resolved type-use edges (separate brief transaction).
+            if !batch_type_uses.is_empty() {
+                let conn = db.lock().map_err(|_| CoreError::LockPoisoned)?;
+                let tx = conn.unchecked_transaction()?;
+                for edge in &batch_type_uses {
+                    if let Err(e) = writer::insert_type_use_edge(&tx, edge) {
+                        tracing::warn!("type_use_edge insert error: {}", e);
+                    }
+                }
+                tx.commit()?;
+            }
 
             tracing::info!(
                 "batch written: {} files indexed so far",
@@ -246,7 +300,18 @@ impl Indexer {
             }
         }
 
-        // Phase 7: Update workspace indexed_at (brief lock).
+        // Phase 7: Update callsite_count and type_use_count for all symbols.
+        {
+            let conn = db.lock().map_err(|_| CoreError::LockPoisoned)?;
+            if let Err(e) = writer::update_callsite_counts(&conn, workspace_id) {
+                tracing::warn!("callsite_count update error: {}", e);
+            }
+            if let Err(e) = writer::update_type_use_counts(&conn, workspace_id) {
+                tracing::warn!("type_use_count update error: {}", e);
+            }
+        }
+
+        // Phase 8: Update workspace indexed_at (brief lock).
         {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -306,6 +371,7 @@ struct ParsedFile {
     symbols: Vec<Symbol>,
     calls: Vec<CallEdge>,
     file_edges: Vec<crate::types::FileEdge>,
+    pending_type_uses: Vec<PendingTypeUse>,
 }
 
 /// Collect all supported source files under `root`, returning `(abs_path, rel_path, mtime, size)`.

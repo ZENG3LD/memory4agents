@@ -24,6 +24,13 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         col: row.get(7)?,
         parent_name: row.get(8)?,
         signature: row.get(9)?,
+        body_hash: row.get(10)?,
+        shape_fingerprint: row.get(11).unwrap_or(None),
+        shape_fingerprint_loose: row.get(12).unwrap_or(None),
+        field_count: row.get::<_, Option<i64>>(13).unwrap_or(None).map(|v| v as u32),
+        shape_summary: row.get(14).unwrap_or(None),
+        callsite_count: row.get::<_, Option<i64>>(15).unwrap_or(None).map(|v| v as u32).unwrap_or(0),
+        type_use_count: row.get::<_, Option<i64>>(16).unwrap_or(None).map(|v| v as u32).unwrap_or(0),
     })
 }
 
@@ -50,8 +57,8 @@ pub fn get_symbols_in_file(
     file_path: &str,
 ) -> Result<Vec<Symbol>, CoreError> {
     let mut stmt = conn.prepare(
-        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature
-         FROM symbols WHERE workspace_id = ?1 AND file_path = ?2",
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+         FROM symbols WHERE workspace_id = ?1 AND file_path = ?2 ORDER BY line",
     )?;
     let symbols = stmt
         .query_map(params![workspace_id, file_path], row_to_symbol)?
@@ -130,7 +137,8 @@ pub fn get_callers_of(
             // Precise lookup by id.
             let mut stmt = conn.prepare(
                 "SELECT id, workspace_id, file_path, name, kind, visibility,
-                        line, col, parent_name, signature
+                        line, col, parent_name, signature, body_hash, shape_fingerprint,
+                        shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
                  FROM symbols WHERE id = ?1",
             )?;
             let sym = stmt
@@ -153,7 +161,8 @@ pub fn get_callers_of(
             // we don't inflate results with every symbol in the file.
             let mut stmt = conn.prepare(
                 "SELECT id, workspace_id, file_path, name, kind, visibility,
-                        line, col, parent_name, signature
+                        line, col, parent_name, signature, body_hash, shape_fingerprint,
+                        shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
                  FROM symbols
                  WHERE workspace_id = ?1 AND file_path = ?2
                  ORDER BY line ASC
@@ -335,7 +344,7 @@ pub fn resolve_symbol_to_crate(
 ) -> Result<Vec<(Symbol, CrateNode)>, CoreError> {
     // Pull all matching symbols first.
     let mut sym_stmt = conn.prepare(
-        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
          FROM symbols
          WHERE workspace_id = ?1 AND name = ?2",
     )?;
@@ -540,6 +549,205 @@ pub fn get_hotspots(
     }
 }
 
+/// Get all symbols with a given name, optionally filtered by workspace and kind.
+pub fn get_symbols_by_name(
+    conn: &Connection,
+    name: &str,
+    workspace_id: Option<&str>,
+    kind: Option<&str>,
+) -> Result<Vec<Symbol>, CoreError> {
+    macro_rules! collect_syms {
+        ($stmt:expr, $params:expr) => {{
+            let mut stmt = conn.prepare($stmt)?;
+            let result: Vec<Symbol> = stmt
+                .query_map($params, row_to_symbol)?
+                .filter_map(|r| match r {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!("[dig2memory] row read error: {e}");
+                        None
+                    }
+                })
+                .collect();
+            result
+        }};
+    }
+
+    let symbols = match (workspace_id, kind) {
+        (Some(ws), Some(k)) => collect_syms!(
+            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+             FROM symbols WHERE name = ?1 AND workspace_id = ?2 AND kind = ?3",
+            params![name, ws, k]
+        ),
+        (Some(ws), None) => collect_syms!(
+            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+             FROM symbols WHERE name = ?1 AND workspace_id = ?2",
+            params![name, ws]
+        ),
+        (None, Some(k)) => collect_syms!(
+            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+             FROM symbols WHERE name = ?1 AND kind = ?2",
+            params![name, k]
+        ),
+        (None, None) => collect_syms!(
+            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+             FROM symbols WHERE name = ?1",
+            params![name]
+        ),
+    };
+    Ok(symbols)
+}
+
+/// A row from a semantic duplicates query.
+pub struct SemanticDupRow {
+    pub shape_fingerprint: String,
+    pub name: String,
+    pub file_path: String,
+    pub line: u32,
+    pub kind: String,
+    pub field_count: Option<u32>,
+    pub shape_summary: Option<String>,
+}
+
+/// Options for semantic duplicates query.
+pub struct SemanticDupOptions<'a> {
+    pub workspace_id: &'a str,
+    pub path_prefix: Option<&'a str>,
+    pub kinds: Option<&'a [String]>,
+    /// If true, group by shape_fingerprint_loose instead of shape_fingerprint.
+    pub loose: bool,
+}
+
+/// Get all symbols with a non-null shape fingerprint in a workspace,
+/// optionally filtered by path prefix and kind list.
+pub fn get_semantic_dup_rows(
+    conn: &Connection,
+    opts: SemanticDupOptions<'_>,
+) -> Result<Vec<SemanticDupRow>, CoreError> {
+    let fp_col = if opts.loose {
+        "shape_fingerprint_loose"
+    } else {
+        "shape_fingerprint"
+    };
+
+    // Build the kind IN clause string if needed (must outlive `conditions`)
+    let kind_clause: Option<String> = opts.kinds.and_then(|ks| {
+        if ks.is_empty() {
+            None
+        } else {
+            let placeholders: Vec<String> = (3..3 + ks.len()).map(|i| format!("?{i}")).collect();
+            Some(format!("kind IN ({})", placeholders.join(", ")))
+        }
+    });
+
+    // Build WHERE conditions — strings must live as long as `conditions`
+    let fp_not_null = format!("{fp_col} IS NOT NULL");
+    let mut conditions: Vec<String> = vec![
+        "workspace_id = ?1".to_owned(),
+        fp_not_null,
+    ];
+    if opts.path_prefix.is_some() {
+        conditions.push("file_path LIKE ?2".to_owned());
+    }
+    if let Some(ref kc) = kind_clause {
+        conditions.push(kc.clone());
+    }
+
+    let sql = format!(
+        "SELECT {fp_col}, name, file_path, line, kind, field_count, shape_summary FROM symbols WHERE {} ORDER BY {fp_col}",
+        conditions.join(" AND ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    // Build params
+    let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    param_values.push(Box::new(opts.workspace_id.to_owned()));
+    if let Some(prefix) = opts.path_prefix {
+        param_values.push(Box::new(format!("{prefix}%")));
+    }
+    if let Some(ks) = opts.kinds {
+        for k in ks {
+            param_values.push(Box::new(k.clone()));
+        }
+    }
+
+    let refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+    let rows: Vec<SemanticDupRow> = stmt
+        .query_map(refs.as_slice(), |row| {
+            let line_i: i64 = row.get(3)?;
+            let fc: Option<i64> = row.get(5)?;
+            Ok(SemanticDupRow {
+                shape_fingerprint: row.get(0)?,
+                name: row.get(1)?,
+                file_path: row.get(2)?,
+                line: line_i as u32,
+                kind: row.get(4)?,
+                field_count: fc.map(|v| v as u32),
+                shape_summary: row.get(6)?,
+            })
+        })?
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("[dig2memory] semantic dup row error: {e}");
+                None
+            }
+        })
+        .collect();
+
+    Ok(rows)
+}
+
+/// Get names that appear in >= min_count locations, optionally filtered by workspace and kind.
+/// Returns (name, kind, total_count) tuples sorted by total desc.
+pub fn get_duplicate_names(
+    conn: &Connection,
+    workspace_id: &str,
+    min_count: u32,
+    kind: Option<&str>,
+) -> Result<Vec<(String, String, u32)>, CoreError> {
+    macro_rules! collect_dupes {
+        ($stmt:expr, $params:expr) => {{
+            let mut stmt = conn.prepare($stmt)?;
+            let result: Vec<(String, String, u32)> = stmt
+                .query_map($params, |row| {
+                    let cnt: i64 = row.get(2)?;
+                    Ok((row.get(0)?, row.get(1)?, cnt as u32))
+                })?
+                .filter_map(|r| match r {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!("[dig2memory] row read error: {e}");
+                        None
+                    }
+                })
+                .collect();
+            result
+        }};
+    }
+
+    let rows = match kind {
+        Some(k) => collect_dupes!(
+            "SELECT name, kind, COUNT(*) as cnt FROM symbols
+             WHERE workspace_id = ?1 AND kind = ?2
+             GROUP BY name, kind
+             HAVING cnt >= ?3
+             ORDER BY cnt DESC",
+            params![workspace_id, k, min_count]
+        ),
+        None => collect_dupes!(
+            "SELECT name, kind, COUNT(*) as cnt FROM symbols
+             WHERE workspace_id = ?1
+             GROUP BY name, kind
+             HAVING cnt >= ?2
+             ORDER BY cnt DESC",
+            params![workspace_id, min_count]
+        ),
+    };
+    Ok(rows)
+}
+
 /// Count total symbols, optionally filtered by workspace.
 pub fn count_symbols(conn: &Connection, workspace_id: Option<&str>) -> Result<u32, CoreError> {
     match workspace_id {
@@ -621,5 +829,258 @@ pub fn list_workspaces(conn: &Connection) -> Result<Vec<Workspace>, CoreError> {
             }
         })
         .collect();
+    Ok(result)
+}
+
+/// Get all symbols in a workspace, optionally filtered by path_prefix and kinds.
+///
+/// Used by /ast/cluster and /ast/parallel_systems.
+pub fn get_all_symbols_filtered(
+    conn: &Connection,
+    workspace_id: &str,
+    path_prefix: Option<&str>,
+    kinds: Option<&[&str]>,
+) -> Result<Vec<Symbol>, CoreError> {
+    let mut conditions: Vec<String> = vec!["workspace_id = ?1".to_owned()];
+    if path_prefix.is_some() {
+        conditions.push("file_path LIKE ?2".to_owned());
+    }
+    let kind_clause: Option<String> = kinds.and_then(|ks| {
+        if ks.is_empty() {
+            None
+        } else {
+            let base = if path_prefix.is_some() { 3usize } else { 2usize };
+            let placeholders: Vec<String> =
+                (base..base + ks.len()).map(|i| format!("?{i}")).collect();
+            Some(format!("kind IN ({})", placeholders.join(", ")))
+        }
+    });
+    if let Some(ref kc) = kind_clause {
+        conditions.push(kc.clone());
+    }
+
+    let sql = format!(
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE {}",
+        conditions.join(" AND ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    param_values.push(Box::new(workspace_id.to_owned()));
+    if let Some(prefix) = path_prefix {
+        param_values.push(Box::new(format!("{prefix}%")));
+    }
+    if let Some(ks) = kinds {
+        for k in ks {
+            param_values.push(Box::new((*k).to_owned()));
+        }
+    }
+
+    let refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+    let result: Vec<Symbol> = stmt
+        .query_map(refs.as_slice(), row_to_symbol)?
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("[dig2memory] row read error: {e}");
+                None
+            }
+        })
+        .collect();
+    Ok(result)
+}
+
+/// Get symbols by fingerprint for /ast/dead_in_group endpoint.
+pub fn get_symbols_by_fingerprint(
+    conn: &Connection,
+    workspace_id: &str,
+    fingerprint: &str,
+) -> Result<Vec<Symbol>, CoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE workspace_id = ?1 AND shape_fingerprint = ?2 ORDER BY callsite_count DESC, name",
+    )?;
+    let result: Vec<Symbol> = stmt
+        .query_map(params![workspace_id, fingerprint], row_to_symbol)?
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("[dig2memory] row read error: {e}");
+                None
+            }
+        })
+        .collect();
+    Ok(result)
+}
+
+/// A user of a type (from type_use_edges).
+pub struct TypeUser {
+    pub from_symbol_id: i64,
+    pub name: String,
+    pub kind: String,
+    pub file_path: String,
+    pub line: u32,
+    pub use_kind: String,
+}
+
+/// Get all symbols that use a given symbol as a type (by to_symbol_id).
+pub fn get_type_users(
+    conn: &Connection,
+    workspace_id: &str,
+    to_symbol_id: i64,
+) -> Result<Vec<TypeUser>, CoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT e.from_symbol_id, s.name, s.kind, s.file_path, s.line, e.use_kind
+         FROM type_use_edges e
+         JOIN symbols s ON s.id = e.from_symbol_id
+         WHERE e.workspace_id = ?1 AND e.to_symbol_id = ?2
+         ORDER BY s.name",
+    )?;
+    let result: Vec<TypeUser> = stmt
+        .query_map(params![workspace_id, to_symbol_id], |row| {
+            let line_i: i64 = row.get(4)?;
+            Ok(TypeUser {
+                from_symbol_id: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                file_path: row.get(3)?,
+                line: line_i as u32,
+                use_kind: row.get(5)?,
+            })
+        })?
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("[dig2memory] type_users row error: {e}");
+                None
+            }
+        })
+        .collect();
+    Ok(result)
+}
+
+/// Get dead symbols (type_use_count=0 AND callsite_count=0), optionally filtered by path_prefix and kind.
+pub fn get_dead_types(
+    conn: &Connection,
+    workspace_id: &str,
+    path_prefix: Option<&str>,
+    kind: Option<&str>,
+) -> Result<Vec<Symbol>, CoreError> {
+    let mut conditions: Vec<String> = vec![
+        "workspace_id = ?1".to_owned(),
+        "type_use_count = 0".to_owned(),
+        "callsite_count = 0".to_owned(),
+    ];
+    let mut param_idx = 2usize;
+    if path_prefix.is_some() {
+        conditions.push(format!("file_path LIKE ?{param_idx}"));
+        param_idx += 1;
+    }
+    if kind.is_some() {
+        conditions.push(format!("kind = ?{param_idx}"));
+    }
+
+    let sql = format!(
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE {} ORDER BY name",
+        conditions.join(" AND ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    param_values.push(Box::new(workspace_id.to_owned()));
+    if let Some(prefix) = path_prefix {
+        param_values.push(Box::new(format!("{prefix}%")));
+    }
+    if let Some(k) = kind {
+        param_values.push(Box::new(k.to_owned()));
+    }
+
+    let refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+    let result: Vec<Symbol> = stmt
+        .query_map(refs.as_slice(), row_to_symbol)?
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("[dig2memory] dead_types row error: {e}");
+                None
+            }
+        })
+        .collect();
+    Ok(result)
+}
+
+/// Get top-N symbols by type_use_count (usage hotspots).
+pub fn get_usage_hotspots(
+    conn: &Connection,
+    workspace_id: &str,
+    path_prefix: Option<&str>,
+    top: u32,
+) -> Result<Vec<Symbol>, CoreError> {
+    let mut conditions: Vec<String> = vec!["workspace_id = ?1".to_owned()];
+    if path_prefix.is_some() {
+        conditions.push("file_path LIKE ?2".to_owned());
+    }
+
+    let sql = format!(
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE {} ORDER BY type_use_count DESC, name LIMIT ?{}",
+        conditions.join(" AND "),
+        if path_prefix.is_some() { 3 } else { 2 }
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    param_values.push(Box::new(workspace_id.to_owned()));
+    if let Some(prefix) = path_prefix {
+        param_values.push(Box::new(format!("{prefix}%")));
+    }
+    param_values.push(Box::new(top as i64));
+
+    let refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+    let result: Vec<Symbol> = stmt
+        .query_map(refs.as_slice(), row_to_symbol)?
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("[dig2memory] usage_hotspots row error: {e}");
+                None
+            }
+        })
+        .collect();
+    Ok(result)
+}
+
+/// Get symbols by name, optionally filtered by workspace and path_prefix (for /ast/type_usage).
+pub fn get_symbols_by_name_prefix(
+    conn: &Connection,
+    workspace_id: &str,
+    name: &str,
+    path_prefix: Option<&str>,
+) -> Result<Vec<Symbol>, CoreError> {
+    let sql = match path_prefix {
+        Some(_) => "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE workspace_id = ?1 AND name = ?2 AND file_path LIKE ?3 ORDER BY file_path, line",
+        None => "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE workspace_id = ?1 AND name = ?2 ORDER BY file_path, line",
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let result: Vec<Symbol> = match path_prefix {
+        Some(prefix) => stmt
+            .query_map(params![workspace_id, name, format!("{prefix}%")], row_to_symbol)?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("[dig2memory] row read error: {e}");
+                    None
+                }
+            })
+            .collect(),
+        None => stmt
+            .query_map(params![workspace_id, name], row_to_symbol)?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("[dig2memory] row read error: {e}");
+                    None
+                }
+            })
+            .collect(),
+    };
     Ok(result)
 }

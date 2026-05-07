@@ -3,10 +3,13 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use crate::db::reader;
 use crate::search::trigram::fuzzy_search;
-use crate::server::state::{SharedState, AppError};
+use crate::server::state::{AppError, SharedState};
+use crate::types::Symbol;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -14,6 +17,9 @@ pub fn router() -> Router<SharedState> {
         .route("/ast/symbols", get(symbols_in_file))
         .route("/ast/callers", get(callers_of_symbol))
         .route("/ast/deps", get(file_deps))
+        .route("/ast/duplicates", get(duplicates_of_name))
+        .route("/ast/all_duplicates", get(all_duplicates))
+        .route("/ast/semantic_duplicates", get(semantic_duplicates))
 }
 
 #[derive(Deserialize)]
@@ -33,6 +39,20 @@ struct FileQuery {
 struct SymQuery {
     sym: String,
     workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DuplicatesQuery {
+    name: String,
+    workspace: Option<String>,
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AllDuplicatesQuery {
+    workspace: String,
+    min_count: Option<u32>,
+    kind: Option<String>,
 }
 
 async fn search_symbols(
@@ -72,4 +92,435 @@ async fn file_deps(
     let workspace = params.workspace.as_deref().unwrap_or("");
     let results = reader::get_deps_of_file(&db, workspace, &params.file)?;
     Ok(Json(serde_json::json!(results)))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for duplicate classification
+// ---------------------------------------------------------------------------
+
+fn normalize_for_hash(text: &str) -> String {
+    // Strip block comments /* ... */
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    // Collapse whitespace
+    let mut result = String::with_capacity(out.len());
+    let mut prev_space = false;
+    for ch in out.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                result.push(' ');
+            }
+            prev_space = true;
+        } else {
+            result.push(ch);
+            prev_space = false;
+        }
+    }
+    result.trim().to_owned()
+}
+
+fn sha256_hex(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn sig_hash(sig: &Option<String>) -> String {
+    match sig {
+        Some(s) => sha256_hex(&normalize_for_hash(s)),
+        None => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response types
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct DuplicateMember {
+    file: String,
+    line: u32,
+    kind: String,
+    visibility: String,
+}
+
+#[derive(Serialize)]
+struct DuplicateGroup {
+    classification: &'static str,
+    signature_hash: String,
+    body_hash: Option<String>,
+    shape_fingerprint: Option<String>,
+    members: Vec<DuplicateMember>,
+}
+
+#[derive(Serialize)]
+struct DuplicatesResponse {
+    name: String,
+    workspace: Option<String>,
+    groups: Vec<DuplicateGroup>,
+    total_locations: usize,
+}
+
+#[derive(Serialize)]
+struct AllDuplicateEntry {
+    name: String,
+    kind: String,
+    total: u32,
+    exact_groups: usize,
+    structural_groups: usize,
+    name_only_count: usize,
+}
+
+#[derive(Serialize)]
+struct AllDuplicatesResponse {
+    workspace: String,
+    duplicates: Vec<AllDuplicateEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// classify: group symbols by signature/body
+// ---------------------------------------------------------------------------
+
+fn classify_symbols(symbols: Vec<Symbol>) -> Vec<DuplicateGroup> {
+    // Group by (sig_hash, body_hash)
+    // Key: (sig_hash, body_hash_or_empty)
+    // Also track shape_fingerprint per sig_hash (take first non-None)
+    let mut exact_map: HashMap<(String, String), Vec<DuplicateMember>> = HashMap::new();
+    let mut fp_map: HashMap<String, Option<String>> = HashMap::new(); // sig_hash → shape_fingerprint
+
+    for sym in &symbols {
+        let sh = sig_hash(&sym.signature);
+        let bh = sym.body_hash.clone().unwrap_or_default();
+        let member = DuplicateMember {
+            file: sym.file_path.clone(),
+            line: sym.line,
+            kind: sym.kind.to_string(),
+            visibility: sym.visibility.to_string(),
+        };
+        exact_map.entry((sh.clone(), bh)).or_default().push(member);
+        fp_map.entry(sh).or_insert_with(|| sym.shape_fingerprint.clone());
+    }
+
+    // Now promote: same sig, different body → structural; sig empty → name-only
+    // Collect sig_hash → list of (body_hash, members)
+    let mut sig_map: HashMap<String, Vec<(String, Vec<DuplicateMember>)>> = HashMap::new();
+    for ((sh, bh), members) in exact_map {
+        sig_map.entry(sh).or_default().push((bh, members));
+    }
+
+    let mut groups: Vec<DuplicateGroup> = Vec::new();
+
+    for (sh, body_groups) in sig_map {
+        let fp = fp_map.get(&sh).and_then(|v| v.clone());
+        if sh.is_empty() {
+            // No signature at all — name-only
+            let members: Vec<DuplicateMember> =
+                body_groups.into_iter().flat_map(|(_, m)| m).collect();
+            groups.push(DuplicateGroup {
+                classification: "name-only",
+                signature_hash: String::new(),
+                body_hash: None,
+                shape_fingerprint: fp,
+                members,
+            });
+        } else if body_groups.len() == 1 {
+            // Same sig, same body → exact
+            let (bh, members) = body_groups.into_iter().next().unwrap();
+            let body_hash = if bh.is_empty() { None } else { Some(bh) };
+            groups.push(DuplicateGroup {
+                classification: "exact",
+                signature_hash: sh,
+                body_hash,
+                shape_fingerprint: fp,
+                members,
+            });
+        } else {
+            // Same sig, multiple body hashes → structural (one group per body hash)
+            for (bh, members) in body_groups {
+                let body_hash = if bh.is_empty() { None } else { Some(bh) };
+                groups.push(DuplicateGroup {
+                    classification: "structural",
+                    signature_hash: sh.clone(),
+                    body_hash,
+                    shape_fingerprint: fp.clone(),
+                    members,
+                });
+            }
+        }
+    }
+
+    // Sort: exact first, then structural, then name-only; within class by member count desc
+    groups.sort_by(|a, b| {
+        let class_ord = |c: &str| match c {
+            "exact" => 0,
+            "structural" => 1,
+            _ => 2,
+        };
+        class_ord(a.classification)
+            .cmp(&class_ord(b.classification))
+            .then(b.members.len().cmp(&a.members.len()))
+    });
+
+    groups
+}
+
+async fn duplicates_of_name(
+    State(state): State<SharedState>,
+    Query(params): Query<DuplicatesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let symbols = reader::get_symbols_by_name(
+        &db,
+        &params.name,
+        params.workspace.as_deref(),
+        params.kind.as_deref(),
+    )?;
+    let total = symbols.len();
+    let groups = classify_symbols(symbols);
+    let resp = DuplicatesResponse {
+        name: params.name,
+        workspace: params.workspace,
+        groups,
+        total_locations: total,
+    };
+    Ok(Json(serde_json::json!(resp)))
+}
+
+async fn all_duplicates(
+    State(state): State<SharedState>,
+    Query(params): Query<AllDuplicatesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let min_count = params.min_count.unwrap_or(2);
+    let name_kind_totals = reader::get_duplicate_names(
+        &db,
+        &params.workspace,
+        min_count,
+        params.kind.as_deref(),
+    )?;
+
+    let mut duplicates: Vec<AllDuplicateEntry> = Vec::new();
+
+    for (name, kind, total) in name_kind_totals {
+        // Fetch symbols to classify
+        let symbols = reader::get_symbols_by_name(
+            &db,
+            &name,
+            Some(&params.workspace),
+            Some(&kind),
+        )?;
+        let groups = classify_symbols(symbols);
+
+        let mut exact_groups = 0usize;
+        let mut structural_groups = 0usize;
+        let mut name_only_count = 0usize;
+
+        for g in &groups {
+            match g.classification {
+                "exact" => exact_groups += 1,
+                "structural" => structural_groups += 1,
+                _ => name_only_count += g.members.len(),
+            }
+        }
+
+        duplicates.push(AllDuplicateEntry {
+            name,
+            kind,
+            total,
+            exact_groups,
+            structural_groups,
+            name_only_count,
+        });
+    }
+
+    // Already sorted by total desc from SQL
+    let resp = AllDuplicatesResponse {
+        workspace: params.workspace,
+        duplicates,
+    };
+    Ok(Json(serde_json::json!(resp)))
+}
+
+// ---------------------------------------------------------------------------
+// /ast/semantic_duplicates
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SemanticDuplicatesQuery {
+    workspace: String,
+    path_prefix: Option<String>,
+    kind: Option<String>,
+    /// Minimum distinct names in group (default 1).
+    min_names: Option<usize>,
+    /// Minimum total locations in group (default 2).
+    min_locations: Option<usize>,
+    /// Use loose fingerprint (ignores field names / method names). Default false.
+    loose: Option<bool>,
+    /// Minimum field_count for a group (default 0).
+    min_fields: Option<u32>,
+    /// Maximum field_count for a group (default 999999).
+    max_fields: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct SemanticMember {
+    name: String,
+    file: String,
+    line: u32,
+    kind: String,
+}
+
+#[derive(Serialize)]
+struct SemanticGroup {
+    fingerprint: String,
+    kind: String,
+    shape_summary: String,
+    field_count: Option<u32>,
+    names_count: usize,
+    total_locations: usize,
+    members: Vec<SemanticMember>,
+}
+
+#[derive(Serialize)]
+struct SemanticDuplicatesResponse {
+    total_groups: usize,
+    groups: Vec<SemanticGroup>,
+}
+
+async fn semantic_duplicates(
+    State(state): State<SharedState>,
+    Query(params): Query<SemanticDuplicatesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let min_names = params.min_names.unwrap_or(1);
+    let min_locations = params.min_locations.unwrap_or(2);
+    let use_loose = params.loose.unwrap_or(false);
+    let min_fields = params.min_fields.unwrap_or(0);
+    let max_fields = params.max_fields.unwrap_or(999_999);
+
+    // Parse kind filter
+    let kinds: Option<Vec<String>> = params.kind.as_deref().and_then(|k| {
+        if k == "all" || k.is_empty() {
+            None
+        } else {
+            Some(k.split(',').map(|s| s.trim().to_owned()).collect())
+        }
+    });
+
+    let rows = reader::get_semantic_dup_rows(
+        &db,
+        reader::SemanticDupOptions {
+            workspace_id: &params.workspace,
+            path_prefix: params.path_prefix.as_deref(),
+            kinds: kinds.as_deref(),
+            loose: use_loose,
+        },
+    )?;
+
+    // Group by fingerprint
+    let mut fp_to_members: std::collections::BTreeMap<String, Vec<SemanticMember>> =
+        std::collections::BTreeMap::new();
+    let mut fp_to_kind: HashMap<String, String> = HashMap::new();
+    // Take the first non-None shape_summary and field_count per fingerprint.
+    let mut fp_to_summary: HashMap<String, Option<String>> = HashMap::new();
+    let mut fp_to_field_count: HashMap<String, Option<u32>> = HashMap::new();
+
+    for row in rows {
+        let member = SemanticMember {
+            name: row.name,
+            file: row.file_path,
+            line: row.line,
+            kind: row.kind.clone(),
+        };
+        fp_to_kind
+            .entry(row.shape_fingerprint.clone())
+            .or_insert(row.kind);
+        fp_to_summary
+            .entry(row.shape_fingerprint.clone())
+            .or_insert(row.shape_summary);
+        fp_to_field_count
+            .entry(row.shape_fingerprint.clone())
+            .or_insert(row.field_count);
+        fp_to_members
+            .entry(row.shape_fingerprint)
+            .or_default()
+            .push(member);
+    }
+
+    // Build groups, apply filters
+    let mut groups: Vec<SemanticGroup> = Vec::new();
+
+    for (fp, members) in fp_to_members {
+        let total_locations = members.len();
+        if total_locations < min_locations {
+            continue;
+        }
+
+        let unique_names: std::collections::HashSet<&str> =
+            members.iter().map(|m| m.name.as_str()).collect();
+        if unique_names.len() < min_names {
+            continue;
+        }
+
+        let field_count = fp_to_field_count.get(&fp).and_then(|v| *v);
+        // Apply field_count filter (only when field_count is known)
+        if let Some(fc) = field_count {
+            if fc < min_fields || fc > max_fields {
+                continue;
+            }
+        }
+
+        let kind = fp_to_kind
+            .get(&fp)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_owned());
+
+        let shape_summary = fp_to_summary
+            .get(&fp)
+            .and_then(|v| v.clone())
+            .unwrap_or_default();
+
+        let names_count = unique_names.len();
+
+        groups.push(SemanticGroup {
+            fingerprint: fp,
+            kind,
+            shape_summary,
+            field_count,
+            names_count,
+            total_locations,
+            members,
+        });
+    }
+
+    // Sort: total_locations desc, then names_count desc
+    groups.sort_by(|a, b| {
+        b.total_locations
+            .cmp(&a.total_locations)
+            .then(b.names_count.cmp(&a.names_count))
+    });
+
+    let total_groups = groups.len();
+    let resp = SemanticDuplicatesResponse {
+        total_groups,
+        groups,
+    };
+    Ok(Json(serde_json::json!(resp)))
 }

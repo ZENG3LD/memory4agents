@@ -23,6 +23,18 @@ pub struct Symbol {
     pub col: u32,
     pub parent_name: Option<String>,
     pub signature: Option<String>,
+    pub body_hash: Option<String>,
+    pub shape_fingerprint: Option<String>,
+    /// Loose shape fingerprint: like shape_fingerprint but ignores field names (struct/enum records).
+    pub shape_fingerprint_loose: Option<String>,
+    /// Number of fields (struct), variants (enum), or methods (trait).
+    pub field_count: Option<u32>,
+    /// Human-readable shape summary (real content, truncated to 200 chars).
+    pub shape_summary: Option<String>,
+    /// Number of times this symbol's name appears as a callee in call_edges (within the same workspace).
+    pub callsite_count: u32,
+    /// Number of distinct symbols that use this symbol as a type (in-degree from type_use_edges).
+    pub type_use_count: u32,
 }
 
 /// The kind of a symbol across all supported languages.
@@ -131,6 +143,28 @@ impl Visibility {
             _ => None,
         }
     }
+}
+
+/// A pending unresolved type-use edge (collected during AST extraction).
+#[derive(Debug, Clone)]
+pub struct PendingTypeUse {
+    /// Name of the symbol that uses the type (from_symbol).
+    pub from_name: String,
+    /// Start line of from_symbol (used to resolve its id from the line_to_id table).
+    pub from_line: u32,
+    /// Name of the type being used (to_name, may not resolve if external).
+    pub to_name: String,
+    /// Usage kind: 'field' | 'param' | 'return' | 'generic'.
+    pub use_kind: &'static str,
+}
+
+/// A resolved type-use edge ready for DB insertion.
+#[derive(Debug, Clone)]
+pub struct TypeUseEdge {
+    pub workspace_id: String,
+    pub from_symbol_id: i64,
+    pub to_symbol_id: i64,
+    pub use_kind: &'static str,
 }
 
 /// An edge representing a function/method call.

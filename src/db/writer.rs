@@ -1,6 +1,6 @@
 use crate::error::CoreError;
 use crate::search::trigram::trigrams;
-use crate::types::{CallEdge, CrateNode, DepEdge, FileEdge, FileRecord, Symbol, Workspace};
+use crate::types::{CallEdge, CrateNode, DepEdge, FileEdge, FileRecord, Symbol, TypeUseEdge, Workspace};
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
 
@@ -43,12 +43,32 @@ pub fn upsert_file_record(conn: &Connection, rec: &FileRecord) -> Result<(), Cor
     Ok(())
 }
 
-/// Delete all symbols for a given file (cascade removes trigrams and call edges via FK).
+/// Delete all symbols for a given file (cascade removes trigrams; also cleans call/type edges).
 pub fn delete_file_symbols(
     conn: &Connection,
     workspace_id: &str,
     file_path: &str,
 ) -> Result<(), CoreError> {
+    // Collect symbol ids before deleting, so we can remove type_use_edges.
+    let ids: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM symbols WHERE workspace_id = ?1 AND file_path = ?2",
+        )?;
+        let collected: Vec<i64> = stmt
+            .query_map(params![workspace_id, file_path], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        collected
+    };
+
+    // Delete type_use_edges where this file's symbols appear on either side.
+    for id in &ids {
+        conn.execute(
+            "DELETE FROM type_use_edges WHERE workspace_id = ?1 AND (from_symbol_id = ?2 OR to_symbol_id = ?2)",
+            params![workspace_id, id],
+        )?;
+    }
+
     conn.execute(
         "DELETE FROM symbols WHERE workspace_id = ?1 AND file_path = ?2",
         params![workspace_id, file_path],
@@ -63,8 +83,8 @@ pub fn delete_file_symbols(
 /// Insert a symbol and return its new rowid.
 pub fn insert_symbol(conn: &Connection, sym: &Symbol) -> Result<i64, CoreError> {
     conn.execute(
-        "INSERT INTO symbols (workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO symbols (workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             sym.workspace_id,
             sym.file_path,
@@ -75,9 +95,62 @@ pub fn insert_symbol(conn: &Connection, sym: &Symbol) -> Result<i64, CoreError> 
             sym.col,
             sym.parent_name,
             sym.signature,
+            sym.body_hash,
+            sym.shape_fingerprint,
+            sym.shape_fingerprint_loose,
+            sym.field_count.map(|v| v as i64),
+            sym.shape_summary,
+            sym.callsite_count as i64,
+            sym.type_use_count as i64,
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Insert a type-use edge (ignore on duplicate primary key).
+pub fn insert_type_use_edge(conn: &Connection, edge: &TypeUseEdge) -> Result<(), CoreError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO type_use_edges (workspace_id, from_symbol_id, to_symbol_id, use_kind)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            edge.workspace_id,
+            edge.from_symbol_id,
+            edge.to_symbol_id,
+            edge.use_kind,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Update type_use_count for all symbols in a workspace from type_use_edges (in-degree).
+pub fn update_type_use_counts(conn: &Connection, workspace_id: &str) -> Result<(), CoreError> {
+    conn.execute(
+        "UPDATE symbols
+         SET type_use_count = (
+             SELECT COUNT(DISTINCT from_symbol_id)
+             FROM type_use_edges
+             WHERE type_use_edges.workspace_id = symbols.workspace_id
+               AND type_use_edges.to_symbol_id = symbols.id
+         )
+         WHERE workspace_id = ?1",
+        params![workspace_id],
+    )?;
+    Ok(())
+}
+
+/// Update callsite_count for all symbols in a workspace from call_edges.
+pub fn update_callsite_counts(conn: &Connection, workspace_id: &str) -> Result<(), CoreError> {
+    conn.execute(
+        "UPDATE symbols
+         SET callsite_count = (
+             SELECT COUNT(*) FROM call_edges
+             WHERE call_edges.workspace_id = symbols.workspace_id
+               AND call_edges.callee_name = symbols.name
+         )
+         WHERE symbols.workspace_id = ?1",
+        params![workspace_id],
+    )?;
+    Ok(())
 }
 
 /// Compute trigrams for a name and insert them into symbol_trigrams.

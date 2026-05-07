@@ -1,4 +1,6 @@
 pub mod calls;
+pub mod fingerprint;
+pub mod known_types;
 pub mod language;
 pub mod languages;
 pub mod parser;

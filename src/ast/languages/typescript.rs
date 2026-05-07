@@ -198,6 +198,13 @@ impl<'a> SymbolCtx<'a> {
             col: pos.column as u32,
             parent_name,
             signature: None,
+            body_hash: None,
+            shape_fingerprint: None,
+            shape_fingerprint_loose: None,
+            field_count: None,
+            shape_summary: None,
+            callsite_count: 0,
+            type_use_count: 0,
         }
     }
 }

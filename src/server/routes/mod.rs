@@ -3,8 +3,9 @@ use crate::server::state::SharedState;
 
 mod ast;
 mod graph;
-mod index;
 mod health;
+mod index;
+mod usage;
 
 pub fn api_router(state: SharedState) -> Router {
     Router::new()
@@ -12,5 +13,6 @@ pub fn api_router(state: SharedState) -> Router {
         .merge(index::router())
         .merge(ast::router())
         .merge(graph::router())
+        .merge(usage::router())
         .with_state(state)
 }
