@@ -114,6 +114,11 @@ pub fn init_schema(conn: &rusqlite::Connection) -> Result<(), CoreError> {
     let _ = conn.execute_batch(
         "ALTER TABLE symbols ADD COLUMN type_use_count INTEGER NOT NULL DEFAULT 0;",
     );
+    // Migration v0.2.10: impl_trait — trait name for trait impls (NULL for inherent impls).
+    let _ = conn.execute_batch("ALTER TABLE symbols ADD COLUMN impl_trait TEXT;");
+    let _ = conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_symbols_impl_trait ON symbols(workspace_id, impl_trait) WHERE impl_trait IS NOT NULL;",
+    );
     // Migration v0.2.6: type_use_edges table.
     let _ = conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS type_use_edges (

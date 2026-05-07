@@ -35,6 +35,9 @@ pub struct Symbol {
     pub callsite_count: u32,
     /// Number of distinct symbols that use this symbol as a type (in-degree from type_use_edges).
     pub type_use_count: u32,
+    /// For kind=Impl: the trait name being implemented (e.g. "RenderContext" in `impl RenderContext for Foo`).
+    /// None for inherent impls or non-Impl symbols.
+    pub impl_trait: Option<String>,
 }
 
 /// The kind of a symbol across all supported languages.

@@ -51,11 +51,18 @@ curl -X POST "http://127.0.0.1:18200/index" \
 | `/ast/usage_hotspots?workspace=ID&path_prefix=P&top=N` | Top-N types by `type_use_count` desc (most used as types across workspace). |
 | `/ast/orphans?workspace=ID&path_prefix=P&kind=struct&exclude_pub_use=true` | Strict dead: `type_use_count=0 AND callsite_count=0` AND no meaningful `type_use_edges` row. `exclude_pub_use=true` (default) means `pub_use_decl` re-exports don't count as real usage. |
 | `/ast/role_groups?workspace=ID&path_prefix=P&token=theme&min_size=3&kind=trait&use_synonyms=false` | Group types by shared name tokens. `token` (optional): only return group for that token. `min_size` (optional, default 3). `kind` (optional). `use_synonyms=true`: merge synonym tokens under canonical (e.g. style+theme+skin → "style"); response shape changes to `{groups:[{canonical_token,raw_tokens,size,members}]}`. Without `use_synonyms` returns `{groups:[{token,size,members}]}`. |
-| `/ast/find_twins?seed=NAME&workspace=ID&path_prefix=P` | Find types similar to seed by 5 heuristics: `exact_shape` (same strict fingerprint), `loose_shape` (same loose fingerprint, same kind), `shared_token` (overlapping name tokens), `synonym_token` (tokens in same synonym group, includes `synonym_pair:[seed_tok,sym_tok]`), `similar_size` (same kind, field_count ±1). |
+| `/ast/find_twins?seed=NAME&workspace=ID&path_prefix=P` | Find types similar to seed by 5 heuristics: `exact_shape` (same strict fingerprint), `loose_shape` (same loose fingerprint, same kind), `shared_token` (overlapping name tokens), `synonym_token` (tokens in same synonym group, includes `synonym_pair:[seed_tok,sym_tok]`), `similar_size` (same kind, field_count ±1). When seed is a trait — also returns `implementors` list. |
+| `/ast/impls?trait=NAME&workspace=ID&path_prefix=P` | All types implementing trait NAME. Returns `{trait, implementors:[{type,file,line,impl_id}], total}`. |
+| `/ast/inherent_impls?type=NAME&workspace=ID&path_prefix=P` | All inherent impl blocks for type NAME (no trait). Returns `{type, impls:[{file,line,impl_id,method_count}]}`. |
+| `/ast/impl_summary?workspace=ID&path_prefix=P` | All traits with their implementors, sorted by `implementor_count` desc. Returns `{traits:[{name,implementor_count,implementors:[...]}]}`. |
 | `/ast/workspace_summary?workspace=ID&path_prefix=P` | High-level workspace report: `totals` (files/symbols/structs/enums/traits/type_aliases/modules/functions), `dead` (dead struct/enum/trait counts + `by_subsystem` top-10), `hotspots_top10` (by type_use_count), `duplicate_clusters` (exact_count, loose_count, biggest_strict top-5), `role_groups_top` (top-10 by synonym-canonical size), `potential_savings` (exact_dup_locations, loose_dup_locations, estimated_lines_drop). |
 | `/ast/cleanup_plan?workspace=ID&path_prefix=P&limit=20` | Prioritised cleanup action list. Each action: `priority`, `kind` (exact_duplicate_collapse / dead_subsystem_remove / synonym_role_consolidate), `description`, `members`, `estimated_savings_lines`. Priority 1–N ordered by savings desc within each kind tier. Default limit 20. |
 | `/ast/parallel_systems?workspace=ID&path_prefix=P&min_size=N&mode=wcc` | `mode=wcc` (default): weakly-connected components of structural type graph + `parallel_candidates` by euclidean profile distance. `mode=token`: profile-clustering by semantic name tokens — `groups` + `candidate_pairs` with cosine similarity ≥ 0.7 and no shared members. |
 | `/health` | Server status + index stats |
+
+## impl_trait tracking (v0.2.10+)
+
+Column `impl_trait TEXT` on `symbols` — populated for `kind=impl` only. NULL for inherent impls. Use `/ast/impls`, `/ast/inherent_impls`, `/ast/impl_summary` endpoints. `/ast/find_twins` returns `implementors` section when seed is a trait.
 
 ## Synonym token map (v0.2.9+)
 

@@ -83,8 +83,8 @@ pub fn delete_file_symbols(
 /// Insert a symbol and return its new rowid.
 pub fn insert_symbol(conn: &Connection, sym: &Symbol) -> Result<i64, CoreError> {
     conn.execute(
-        "INSERT INTO symbols (workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        "INSERT INTO symbols (workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             sym.workspace_id,
             sym.file_path,
@@ -102,6 +102,7 @@ pub fn insert_symbol(conn: &Connection, sym: &Symbol) -> Result<i64, CoreError> 
             sym.shape_summary,
             sym.callsite_count as i64,
             sym.type_use_count as i64,
+            sym.impl_trait,
         ],
     )?;
     Ok(conn.last_insert_rowid())

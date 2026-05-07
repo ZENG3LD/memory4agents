@@ -31,6 +31,7 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         shape_summary: row.get(14).unwrap_or(None),
         callsite_count: row.get::<_, Option<i64>>(15).unwrap_or(None).map(|v| v as u32).unwrap_or(0),
         type_use_count: row.get::<_, Option<i64>>(16).unwrap_or(None).map(|v| v as u32).unwrap_or(0),
+        impl_trait: row.get(17).unwrap_or(None),
     })
 }
 
@@ -57,7 +58,7 @@ pub fn get_symbols_in_file(
     file_path: &str,
 ) -> Result<Vec<Symbol>, CoreError> {
     let mut stmt = conn.prepare(
-        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
          FROM symbols WHERE workspace_id = ?1 AND file_path = ?2 ORDER BY line",
     )?;
     let symbols = stmt
@@ -138,7 +139,7 @@ pub fn get_callers_of(
             let mut stmt = conn.prepare(
                 "SELECT id, workspace_id, file_path, name, kind, visibility,
                         line, col, parent_name, signature, body_hash, shape_fingerprint,
-                        shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+                        shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
                  FROM symbols WHERE id = ?1",
             )?;
             let sym = stmt
@@ -162,7 +163,7 @@ pub fn get_callers_of(
             let mut stmt = conn.prepare(
                 "SELECT id, workspace_id, file_path, name, kind, visibility,
                         line, col, parent_name, signature, body_hash, shape_fingerprint,
-                        shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+                        shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
                  FROM symbols
                  WHERE workspace_id = ?1 AND file_path = ?2
                  ORDER BY line ASC
@@ -344,7 +345,7 @@ pub fn resolve_symbol_to_crate(
 ) -> Result<Vec<(Symbol, CrateNode)>, CoreError> {
     // Pull all matching symbols first.
     let mut sym_stmt = conn.prepare(
-        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
          FROM symbols
          WHERE workspace_id = ?1 AND name = ?2",
     )?;
@@ -575,22 +576,22 @@ pub fn get_symbols_by_name(
 
     let symbols = match (workspace_id, kind) {
         (Some(ws), Some(k)) => collect_syms!(
-            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
              FROM symbols WHERE name = ?1 AND workspace_id = ?2 AND kind = ?3",
             params![name, ws, k]
         ),
         (Some(ws), None) => collect_syms!(
-            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
              FROM symbols WHERE name = ?1 AND workspace_id = ?2",
             params![name, ws]
         ),
         (None, Some(k)) => collect_syms!(
-            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
              FROM symbols WHERE name = ?1 AND kind = ?2",
             params![name, k]
         ),
         (None, None) => collect_syms!(
-            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count
+            "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
              FROM symbols WHERE name = ?1",
             params![name]
         ),
@@ -860,7 +861,7 @@ pub fn get_all_symbols_filtered(
     }
 
     let sql = format!(
-        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE {}",
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait FROM symbols WHERE {}",
         conditions.join(" AND ")
     );
 
@@ -897,7 +898,7 @@ pub fn get_symbols_by_fingerprint(
     fingerprint: &str,
 ) -> Result<Vec<Symbol>, CoreError> {
     let mut stmt = conn.prepare(
-        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE workspace_id = ?1 AND shape_fingerprint = ?2 ORDER BY callsite_count DESC, name",
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait FROM symbols WHERE workspace_id = ?1 AND shape_fingerprint = ?2 ORDER BY callsite_count DESC, name",
     )?;
     let result: Vec<Symbol> = stmt
         .query_map(params![workspace_id, fingerprint], row_to_symbol)?
@@ -980,7 +981,7 @@ pub fn get_dead_types(
     }
 
     let sql = format!(
-        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE {} ORDER BY name",
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait FROM symbols WHERE {} ORDER BY name",
         conditions.join(" AND ")
     );
 
@@ -1088,7 +1089,7 @@ pub fn get_usage_hotspots(
     }
 
     let sql = format!(
-        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE {} ORDER BY type_use_count DESC, name LIMIT ?{}",
+        "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait FROM symbols WHERE {} ORDER BY type_use_count DESC, name LIMIT ?{}",
         conditions.join(" AND "),
         if path_prefix.is_some() { 3 } else { 2 }
     );
@@ -1123,8 +1124,8 @@ pub fn get_symbols_by_name_prefix(
     path_prefix: Option<&str>,
 ) -> Result<Vec<Symbol>, CoreError> {
     let sql = match path_prefix {
-        Some(_) => "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE workspace_id = ?1 AND name = ?2 AND file_path LIKE ?3 ORDER BY file_path, line",
-        None => "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count FROM symbols WHERE workspace_id = ?1 AND name = ?2 ORDER BY file_path, line",
+        Some(_) => "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait FROM symbols WHERE workspace_id = ?1 AND name = ?2 AND file_path LIKE ?3 ORDER BY file_path, line",
+        None => "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait FROM symbols WHERE workspace_id = ?1 AND name = ?2 ORDER BY file_path, line",
     };
     let mut stmt = conn.prepare(sql)?;
     let result: Vec<Symbol> = match path_prefix {
@@ -1150,4 +1151,154 @@ pub fn get_symbols_by_name_prefix(
             .collect(),
     };
     Ok(result)
+}
+
+/// Get all trait-impl symbols for a given trait name (kind=impl AND impl_trait=?).
+///
+/// `path_prefix` restricts to file paths starting with that prefix.
+pub fn get_impls_of_trait(
+    conn: &Connection,
+    workspace_id: &str,
+    trait_name: &str,
+    path_prefix: Option<&str>,
+) -> Result<Vec<Symbol>, CoreError> {
+    let sql = match path_prefix {
+        Some(_) => "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait FROM symbols WHERE workspace_id = ?1 AND kind = 'impl' AND impl_trait = ?2 AND file_path LIKE ?3 ORDER BY file_path, line",
+        None => "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait FROM symbols WHERE workspace_id = ?1 AND kind = 'impl' AND impl_trait = ?2 ORDER BY file_path, line",
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let result: Vec<Symbol> = match path_prefix {
+        Some(prefix) => stmt
+            .query_map(params![workspace_id, trait_name, format!("{prefix}%")], row_to_symbol)?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("[dig2memory] row read error: {e}");
+                    None
+                }
+            })
+            .collect(),
+        None => stmt
+            .query_map(params![workspace_id, trait_name], row_to_symbol)?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("[dig2memory] row read error: {e}");
+                    None
+                }
+            })
+            .collect(),
+    };
+    Ok(result)
+}
+
+/// Get all inherent-impl symbols for a given type name (kind=impl AND impl_trait IS NULL AND name=?).
+///
+/// `path_prefix` restricts to file paths starting with that prefix.
+pub fn get_inherent_impls_of_type(
+    conn: &Connection,
+    workspace_id: &str,
+    type_name: &str,
+    path_prefix: Option<&str>,
+) -> Result<Vec<Symbol>, CoreError> {
+    let sql = match path_prefix {
+        Some(_) => "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait FROM symbols WHERE workspace_id = ?1 AND kind = 'impl' AND impl_trait IS NULL AND name = ?2 AND file_path LIKE ?3 ORDER BY file_path, line",
+        None => "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait FROM symbols WHERE workspace_id = ?1 AND kind = 'impl' AND impl_trait IS NULL AND name = ?2 ORDER BY file_path, line",
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let result: Vec<Symbol> = match path_prefix {
+        Some(prefix) => stmt
+            .query_map(params![workspace_id, type_name, format!("{prefix}%")], row_to_symbol)?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("[dig2memory] row read error: {e}");
+                    None
+                }
+            })
+            .collect(),
+        None => stmt
+            .query_map(params![workspace_id, type_name], row_to_symbol)?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("[dig2memory] row read error: {e}");
+                    None
+                }
+            })
+            .collect(),
+    };
+    Ok(result)
+}
+
+/// Implementor summary row: (trait_name, implementor_count, implementors).
+pub struct TraitImplSummaryRow {
+    pub trait_name: String,
+    pub implementor_count: u32,
+    pub implementors: Vec<String>,
+}
+
+/// Get impl summary: for each trait, list all implementor type names.
+///
+/// Returns rows sorted by implementor_count desc.
+pub fn get_impl_summary(
+    conn: &Connection,
+    workspace_id: &str,
+    path_prefix: Option<&str>,
+) -> Result<Vec<TraitImplSummaryRow>, CoreError> {
+    // First: fetch all (impl_trait, name) pairs for this workspace.
+    let sql = match path_prefix {
+        Some(_) => "SELECT impl_trait, name FROM symbols WHERE workspace_id = ?1 AND kind = 'impl' AND impl_trait IS NOT NULL AND file_path LIKE ?2 ORDER BY impl_trait, name",
+        None => "SELECT impl_trait, name FROM symbols WHERE workspace_id = ?1 AND kind = 'impl' AND impl_trait IS NOT NULL ORDER BY impl_trait, name",
+    };
+    let mut stmt = conn.prepare(sql)?;
+
+    let pairs: Vec<(String, String)> = match path_prefix {
+        Some(prefix) => stmt
+            .query_map(params![workspace_id, format!("{prefix}%")], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("[dig2memory] row read error: {e}");
+                    None
+                }
+            })
+            .collect(),
+        None => stmt
+            .query_map(params![workspace_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("[dig2memory] row read error: {e}");
+                    None
+                }
+            })
+            .collect(),
+    };
+
+    // Group by trait_name.
+    let mut map: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for (trait_name, impl_name) in pairs {
+        map.entry(trait_name).or_default().push(impl_name);
+    }
+
+    let mut rows: Vec<TraitImplSummaryRow> = map
+        .into_iter()
+        .map(|(trait_name, implementors)| {
+            let implementor_count = implementors.len() as u32;
+            TraitImplSummaryRow {
+                trait_name,
+                implementor_count,
+                implementors,
+            }
+        })
+        .collect();
+
+    // Sort by implementor_count desc.
+    rows.sort_by(|a, b| b.implementor_count.cmp(&a.implementor_count));
+    Ok(rows)
 }

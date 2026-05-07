@@ -20,6 +20,9 @@ pub fn router() -> Router<SharedState> {
         .route("/ast/duplicates", get(duplicates_of_name))
         .route("/ast/all_duplicates", get(all_duplicates))
         .route("/ast/semantic_duplicates", get(semantic_duplicates))
+        .route("/ast/impls", get(impls_of_trait))
+        .route("/ast/inherent_impls", get(inherent_impls_of_type))
+        .route("/ast/impl_summary", get(impl_summary))
 }
 
 #[derive(Deserialize)]
@@ -522,5 +525,167 @@ async fn semantic_duplicates(
         total_groups,
         groups,
     };
+    Ok(Json(serde_json::json!(resp)))
+}
+
+// ---------------------------------------------------------------------------
+// /ast/impls?trait=NAME&workspace=ID&path_prefix=P
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ImplsQuery {
+    #[serde(rename = "trait")]
+    trait_name: String,
+    workspace: String,
+    path_prefix: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ImplementorEntry {
+    #[serde(rename = "type")]
+    type_name: String,
+    file: String,
+    line: u32,
+    impl_id: i64,
+}
+
+#[derive(Serialize)]
+struct ImplsResponse {
+    #[serde(rename = "trait")]
+    trait_name: String,
+    implementors: Vec<ImplementorEntry>,
+    total: usize,
+}
+
+async fn impls_of_trait(
+    State(state): State<SharedState>,
+    Query(params): Query<ImplsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let symbols = reader::get_impls_of_trait(
+        &db,
+        &params.workspace,
+        &params.trait_name,
+        params.path_prefix.as_deref(),
+    )?;
+    let total = symbols.len();
+    let implementors: Vec<ImplementorEntry> = symbols
+        .into_iter()
+        .map(|s| ImplementorEntry {
+            type_name: s.name,
+            file: s.file_path,
+            line: s.line,
+            impl_id: s.id,
+        })
+        .collect();
+    let resp = ImplsResponse {
+        trait_name: params.trait_name,
+        implementors,
+        total,
+    };
+    Ok(Json(serde_json::json!(resp)))
+}
+
+// ---------------------------------------------------------------------------
+// /ast/inherent_impls?type=NAME&workspace=ID&path_prefix=P
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct InherentImplsQuery {
+    #[serde(rename = "type")]
+    type_name: String,
+    workspace: String,
+    path_prefix: Option<String>,
+}
+
+#[derive(Serialize)]
+struct InherentImplEntry {
+    file: String,
+    line: u32,
+    impl_id: i64,
+    method_count: u32,
+}
+
+#[derive(Serialize)]
+struct InherentImplsResponse {
+    #[serde(rename = "type")]
+    type_name: String,
+    impls: Vec<InherentImplEntry>,
+}
+
+async fn inherent_impls_of_type(
+    State(state): State<SharedState>,
+    Query(params): Query<InherentImplsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let impl_syms = reader::get_inherent_impls_of_type(
+        &db,
+        &params.workspace,
+        &params.type_name,
+        params.path_prefix.as_deref(),
+    )?;
+
+    let mut impls: Vec<InherentImplEntry> = Vec::new();
+    for sym in impl_syms {
+        // Count methods/functions whose parent_name == sym.name in the same file.
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE workspace_id = ?1 AND file_path = ?2 AND parent_name = ?3 AND kind IN ('function','async_function','method')",
+                rusqlite::params![sym.workspace_id, sym.file_path, sym.name],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        impls.push(InherentImplEntry {
+            file: sym.file_path,
+            line: sym.line,
+            impl_id: sym.id,
+            method_count: count as u32,
+        });
+    }
+
+    let resp = InherentImplsResponse {
+        type_name: params.type_name,
+        impls,
+    };
+    Ok(Json(serde_json::json!(resp)))
+}
+
+// ---------------------------------------------------------------------------
+// /ast/impl_summary?workspace=ID&path_prefix=P
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ImplSummaryQuery {
+    workspace: String,
+    path_prefix: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TraitImplSummaryEntry {
+    name: String,
+    implementor_count: u32,
+    implementors: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ImplSummaryResponse {
+    traits: Vec<TraitImplSummaryEntry>,
+}
+
+async fn impl_summary(
+    State(state): State<SharedState>,
+    Query(params): Query<ImplSummaryQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let rows = reader::get_impl_summary(&db, &params.workspace, params.path_prefix.as_deref())?;
+    let traits: Vec<TraitImplSummaryEntry> = rows
+        .into_iter()
+        .map(|r| TraitImplSummaryEntry {
+            name: r.trait_name,
+            implementor_count: r.implementor_count,
+            implementors: r.implementors,
+        })
+        .collect();
+    let resp = ImplSummaryResponse { traits };
     Ok(Json(serde_json::json!(resp)))
 }

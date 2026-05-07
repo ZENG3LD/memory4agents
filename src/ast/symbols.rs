@@ -482,7 +482,12 @@ fn get_name(node: Node<'_>, src: &[u8]) -> Option<String> {
 }
 
 fn get_impl_name(node: Node<'_>, src: &[u8]) -> Option<String> {
-    // For impl nodes: look for type_identifier child (the type being implemented).
+    // For impl_item: the "type" field is the concrete type (Bar in `impl Foo for Bar`).
+    // Fall back to the first type_identifier if "type" field not present.
+    if let Some(type_node) = node.child_by_field_name("type") {
+        return extract_type_name_from_type_node(type_node, src);
+    }
+    // Fallback for older tree-sitter grammars or unusual nodes.
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "type_identifier" {
@@ -490,6 +495,48 @@ fn get_impl_name(node: Node<'_>, src: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract the trait name from an impl_item node, if this is a trait impl.
+///
+/// Returns `Some("Foo")` for `impl Foo for Bar` and `None` for `impl Bar`.
+fn get_impl_trait(node: Node<'_>, src: &[u8]) -> Option<String> {
+    let trait_node = node.child_by_field_name("trait")?;
+    extract_type_name_from_type_node(trait_node, src)
+}
+
+/// Given a type node (type_identifier / scoped_type_identifier / generic_type),
+/// extract the simple name (last segment for scoped, base for generic).
+fn extract_type_name_from_type_node(node: Node<'_>, src: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" => Some(node_text(node, src).to_owned()),
+        "scoped_type_identifier" => {
+            // e.g. `module::Foo` — take the last type_identifier child.
+            let mut last: Option<String> = None;
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "type_identifier" {
+                    last = Some(node_text(child, src).to_owned());
+                }
+            }
+            last
+        }
+        "generic_type" => {
+            // e.g. `Foo<T>` — take the name portion (first type_identifier or scoped).
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "type_identifier" => return Some(node_text(child, src).to_owned()),
+                    "scoped_type_identifier" => {
+                        return extract_type_name_from_type_node(child, src)
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn get_visibility(node: Node<'_>, src: &[u8]) -> Visibility {
@@ -687,6 +734,7 @@ fn walk_node(
                     shape_summary: None,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
                 parent_stack.push(name);
                 true
@@ -723,6 +771,7 @@ fn walk_node(
                     shape_summary,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
                 parent_stack.push(name);
                 true
@@ -759,6 +808,7 @@ fn walk_node(
                     shape_summary,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
                 parent_stack.push(name);
                 true
@@ -795,6 +845,7 @@ fn walk_node(
                     shape_summary,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
                 parent_stack.push(name);
                 true
@@ -808,6 +859,7 @@ fn walk_node(
                 let parent_name = parent_stack.last().cloned();
                 let signature = Some(signature_without_block(node, src));
                 let body_hash = body_hash_of_block(node, src);
+                let impl_trait = get_impl_trait(node, src);
                 symbols.push(Symbol {
                     id: 0,
                     workspace_id: workspace_id.to_owned(),
@@ -826,6 +878,7 @@ fn walk_node(
                     shape_summary: None,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait,
                 });
                 parent_stack.push(name);
                 true
@@ -857,6 +910,7 @@ fn walk_node(
                     shape_summary: None,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
             }
             false
@@ -890,6 +944,7 @@ fn walk_node(
                     shape_summary,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
             }
             false
@@ -926,6 +981,7 @@ fn walk_node(
                     shape_summary: None,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
             }
             false
@@ -954,6 +1010,7 @@ fn walk_node(
                     shape_summary: None,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
                 if has_body(node) {
                     parent_stack.push(name);

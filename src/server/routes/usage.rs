@@ -1100,12 +1100,23 @@ struct SynonymTokenTwin {
 }
 
 #[derive(Serialize)]
+struct ImplementorEntry {
+    #[serde(rename = "type")]
+    type_name: String,
+    file: String,
+    line: u32,
+    impl_id: i64,
+}
+
+#[derive(Serialize)]
 struct FindTwinsDetail {
     exact_shape: Vec<TwinEntry>,
     loose_shape: Vec<TwinEntry>,
     shared_token: Vec<SharedTokenTwin>,
     synonym_token: Vec<SynonymTokenTwin>,
     similar_size: Vec<TwinEntry>,
+    /// Populated when seed is a trait: all types that implement it.
+    implementors: Vec<ImplementorEntry>,
 }
 
 async fn find_twins(
@@ -1251,6 +1262,27 @@ async fn find_twins(
     synonym_token.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
     similar_size.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
 
+    // If seed is a trait, fetch all implementors.
+    let implementors: Vec<ImplementorEntry> = if seed.kind == crate::types::SymbolKind::Trait {
+        reader::get_impls_of_trait(
+            &db,
+            workspace,
+            &params.seed,
+            params.path_prefix.as_deref(),
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| ImplementorEntry {
+            type_name: s.name,
+            file: s.file_path,
+            line: s.line,
+            impl_id: s.id,
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+
     let resp = FindTwinsResponse {
         seed: params.seed,
         twins: FindTwinsDetail {
@@ -1259,6 +1291,7 @@ async fn find_twins(
             shared_token,
             synonym_token,
             similar_size,
+            implementors,
         },
     };
     Ok(Json(serde_json::json!(resp)))
