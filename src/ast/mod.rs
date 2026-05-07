@@ -6,6 +6,7 @@ pub mod languages;
 pub mod parser;
 pub mod registry;
 pub mod symbols;
+pub mod synonyms;
 
 pub use calls::extract_calls;
 pub use language::LanguageSupport;

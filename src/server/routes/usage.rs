@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::ast::known_types::{extract_type_names, tokenize_name};
+use crate::ast::synonyms::{canonical_label, synonym_group};
 use crate::db::reader;
 use crate::server::state::{AppError, SharedState};
 use crate::types::Symbol;
@@ -22,6 +23,8 @@ pub fn router() -> Router<SharedState> {
         .route("/ast/orphans", get(orphans))
         .route("/ast/role_groups", get(role_groups))
         .route("/ast/find_twins", get(find_twins))
+        .route("/ast/workspace_summary", get(workspace_summary))
+        .route("/ast/cleanup_plan", get(cleanup_plan))
 }
 
 // ---------------------------------------------------------------------------
@@ -893,6 +896,8 @@ struct RoleGroupsQuery {
     token: Option<String>,
     min_size: Option<usize>,
     kind: Option<String>,
+    /// When true, merge synonym tokens (style+theme+skin → canonical "style").
+    use_synonyms: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -914,8 +919,21 @@ struct RoleGroup {
 }
 
 #[derive(Serialize)]
+struct RoleGroupSynonym {
+    canonical_token: String,
+    raw_tokens: Vec<String>,
+    size: usize,
+    members: Vec<RoleGroupMember>,
+}
+
+#[derive(Serialize)]
 struct RoleGroupsResponse {
     groups: Vec<RoleGroup>,
+}
+
+#[derive(Serialize)]
+struct RoleGroupsSynonymResponse {
+    groups: Vec<RoleGroupSynonym>,
 }
 
 async fn role_groups(
@@ -925,6 +943,7 @@ async fn role_groups(
     let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
     let min_size = params.min_size.unwrap_or(3);
     let workspace = &params.workspace;
+    let use_synonyms = params.use_synonyms.unwrap_or(false);
 
     let kind_filter: &[&str] = &["struct", "enum", "trait", "type_alias"];
     let all_syms = reader::get_all_symbols_filtered(
@@ -941,7 +960,55 @@ async fn role_groups(
         all_syms.iter().collect()
     };
 
-    // Build token → members map
+    if use_synonyms {
+        // canonical_token → (raw_tokens_seen, members)
+        let mut canon_map: HashMap<String, (HashSet<String>, Vec<RoleGroupMember>)> = HashMap::new();
+
+        for sym in &filtered {
+            let tokens = tokenize_name(&sym.name);
+            // Deduplicate canonicals per symbol so it doesn't appear multiple times in one group
+            let mut seen_canonicals: HashSet<String> = HashSet::new();
+            for token in &tokens {
+                let canon = canonical_label(token);
+                if let Some(ref requested) = params.token {
+                    // token filter: match raw token or canonical
+                    if token != requested && &canon != requested {
+                        continue;
+                    }
+                }
+                if seen_canonicals.insert(canon.clone()) {
+                    let entry = canon_map.entry(canon.clone()).or_insert_with(|| (HashSet::new(), Vec::new()));
+                    entry.0.insert(token.clone());
+                    entry.1.push(RoleGroupMember {
+                        name: sym.name.clone(),
+                        kind: sym.kind.to_string(),
+                        file: sym.file_path.clone(),
+                        line: sym.line,
+                        field_count: sym.field_count,
+                        type_use_count: sym.type_use_count,
+                        tokens: tokens.clone(),
+                    });
+                }
+            }
+        }
+
+        let mut groups: Vec<RoleGroupSynonym> = canon_map
+            .into_iter()
+            .filter(|(_, (_, members))| members.len() >= min_size)
+            .map(|(canonical_token, (raw_set, mut members))| {
+                members.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
+                let size = members.len();
+                let mut raw_tokens: Vec<String> = raw_set.into_iter().collect();
+                raw_tokens.sort();
+                RoleGroupSynonym { canonical_token, raw_tokens, size, members }
+            })
+            .collect();
+
+        groups.sort_by(|a, b| b.size.cmp(&a.size).then(a.canonical_token.cmp(&b.canonical_token)));
+        return Ok(Json(serde_json::json!(RoleGroupsSynonymResponse { groups })));
+    }
+
+    // Build token → members map (raw token mode)
     let mut token_map: HashMap<String, Vec<RoleGroupMember>> = HashMap::new();
 
     for sym in &filtered {
@@ -1022,10 +1089,22 @@ struct FindTwinsResponse {
 }
 
 #[derive(Serialize)]
+struct SynonymTokenTwin {
+    name: String,
+    kind: String,
+    file: String,
+    line: u32,
+    field_count: Option<u32>,
+    type_use_count: u32,
+    synonym_pair: [String; 2],
+}
+
+#[derive(Serialize)]
 struct FindTwinsDetail {
     exact_shape: Vec<TwinEntry>,
     loose_shape: Vec<TwinEntry>,
     shared_token: Vec<SharedTokenTwin>,
+    synonym_token: Vec<SynonymTokenTwin>,
     similar_size: Vec<TwinEntry>,
 }
 
@@ -1058,14 +1137,23 @@ async fn find_twins(
     }
 
     let seed = seed_syms[0];
-    let seed_tokens: std::collections::HashSet<String> =
-        tokenize_name(&seed.name).into_iter().collect();
+    let seed_raw_tokens: Vec<String> = tokenize_name(&seed.name);
+    let seed_tokens: HashSet<String> = seed_raw_tokens.iter().cloned().collect();
     let seed_field_count = seed.field_count.unwrap_or(0);
     let seed_kind = seed.kind.to_string();
+
+    // Pre-compute canonical tokens for seed (token → canonical)
+    // Also build: canonical → first raw seed token that maps to it
+    let mut seed_canon_to_raw: HashMap<String, String> = HashMap::new();
+    for t in &seed_raw_tokens {
+        let canon = canonical_label(t);
+        seed_canon_to_raw.entry(canon).or_insert_with(|| t.clone());
+    }
 
     let mut exact_shape: Vec<TwinEntry> = Vec::new();
     let mut loose_shape: Vec<TwinEntry> = Vec::new();
     let mut shared_token: Vec<SharedTokenTwin> = Vec::new();
+    let mut synonym_token: Vec<SynonymTokenTwin> = Vec::new();
     let mut similar_size: Vec<TwinEntry> = Vec::new();
 
     for sym in &all_syms {
@@ -1099,9 +1187,9 @@ async fn find_twins(
             }
         }
 
-        // c) Shared name tokens
-        let sym_tokens: std::collections::HashSet<String> =
-            tokenize_name(&sym.name).into_iter().collect();
+        // c) Shared name tokens (exact token match)
+        let sym_raw_tokens: Vec<String> = tokenize_name(&sym.name);
+        let sym_tokens: HashSet<String> = sym_raw_tokens.iter().cloned().collect();
         let shared: Vec<String> = seed_tokens.intersection(&sym_tokens).cloned().collect();
         if !shared.is_empty() {
             let mut shared_sorted = shared;
@@ -1118,7 +1206,36 @@ async fn find_twins(
             continue;
         }
 
-        // d) Similar field/method count ±1, same kind
+        // d) Synonym token — a token in sym maps to a canonical that seed also has
+        let mut synonym_pair_found: Option<[String; 2]> = None;
+        'outer: for sym_tok in &sym_raw_tokens {
+            let sym_canon = canonical_label(sym_tok);
+            // Only consider tokens that ARE in a synonym group (non-trivial)
+            if synonym_group(sym_tok).is_empty() {
+                continue;
+            }
+            if let Some(seed_raw) = seed_canon_to_raw.get(&sym_canon) {
+                // Make sure they're not the same raw token (that's shared_token above)
+                if seed_raw != sym_tok {
+                    synonym_pair_found = Some([seed_raw.clone(), sym_tok.clone()]);
+                    break 'outer;
+                }
+            }
+        }
+        if let Some(pair) = synonym_pair_found {
+            synonym_token.push(SynonymTokenTwin {
+                name: sym.name.clone(),
+                kind: sym_kind.clone(),
+                file: sym.file_path.clone(),
+                line: sym.line,
+                field_count: sym.field_count,
+                type_use_count: sym.type_use_count,
+                synonym_pair: pair,
+            });
+            continue;
+        }
+
+        // e) Similar field/method count ±1, same kind
         if sym_kind == seed_kind {
             let sym_fc = sym.field_count.unwrap_or(0);
             if sym_fc.abs_diff(seed_field_count) <= 1 {
@@ -1131,6 +1248,7 @@ async fn find_twins(
     exact_shape.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count));
     loose_shape.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count));
     shared_token.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
+    synonym_token.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
     similar_size.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
 
     let resp = FindTwinsResponse {
@@ -1139,9 +1257,482 @@ async fn find_twins(
             exact_shape,
             loose_shape,
             shared_token,
+            synonym_token,
             similar_size,
         },
     };
+    Ok(Json(serde_json::json!(resp)))
+}
+
+// ---------------------------------------------------------------------------
+// /ast/workspace_summary — high-level metrics for a workspace
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct WorkspaceSummaryQuery {
+    workspace: String,
+    path_prefix: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WsTotals {
+    files: usize,
+    symbols: usize,
+    structs: usize,
+    enums: usize,
+    traits: usize,
+    type_aliases: usize,
+    modules: usize,
+    functions: usize,
+}
+
+#[derive(Serialize)]
+struct WsDeadSubsystem {
+    path: String,
+    dead_count: usize,
+}
+
+#[derive(Serialize)]
+struct WsDead {
+    structs: usize,
+    enums: usize,
+    traits: usize,
+    by_subsystem: Vec<WsDeadSubsystem>,
+}
+
+#[derive(Serialize)]
+struct WsHotspot {
+    name: String,
+    type_use_count: u32,
+}
+
+#[derive(Serialize)]
+struct WsBiggestDupGroup {
+    shape_summary: String,
+    names_count: usize,
+    members: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct WsDuplicates {
+    exact_count: usize,
+    loose_count: usize,
+    biggest_strict: Vec<WsBiggestDupGroup>,
+}
+
+#[derive(Serialize)]
+struct WsRoleGroup {
+    canonical_token: String,
+    size: usize,
+    raw_tokens: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct WsPotentialSavings {
+    exact_dup_locations: usize,
+    loose_dup_locations: usize,
+    estimated_lines_drop: usize,
+}
+
+#[derive(Serialize)]
+struct WorkspaceSummaryResponse {
+    totals: WsTotals,
+    dead: WsDead,
+    hotspots_top10: Vec<WsHotspot>,
+    duplicate_clusters: WsDuplicates,
+    role_groups_top: Vec<WsRoleGroup>,
+    potential_savings: WsPotentialSavings,
+}
+
+async fn workspace_summary(
+    State(state): State<SharedState>,
+    Query(params): Query<WorkspaceSummaryQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let workspace = &params.workspace;
+    let path_prefix = params.path_prefix.as_deref();
+
+    // All symbols (all kinds for counts)
+    let all_kinds: &[&str] = &[
+        "struct", "enum", "trait", "type_alias", "module",
+        "function", "async_function", "method",
+    ];
+    let all_syms =
+        reader::get_all_symbols_filtered(&db, workspace, path_prefix, Some(all_kinds))?;
+
+    // Count by kind
+    let mut n_structs = 0usize;
+    let mut n_enums = 0usize;
+    let mut n_traits = 0usize;
+    let mut n_aliases = 0usize;
+    let mut n_modules = 0usize;
+    let mut n_functions = 0usize;
+
+    for s in &all_syms {
+        match s.kind.to_string().as_str() {
+            "struct" => n_structs += 1,
+            "enum" => n_enums += 1,
+            "trait" => n_traits += 1,
+            "type_alias" => n_aliases += 1,
+            "module" => n_modules += 1,
+            "function" | "async_function" | "method" => n_functions += 1,
+            _ => {}
+        }
+    }
+
+    // Unique files
+    let file_set: HashSet<&str> = all_syms.iter().map(|s| s.file_path.as_str()).collect();
+    let n_files = file_set.len();
+
+    // Dead structural types
+    let struct_kind_strs: &[&str] = &["struct", "enum", "trait", "type_alias"];
+    let struct_kinds_owned: Vec<String> =
+        struct_kind_strs.iter().map(|s| (*s).to_owned()).collect();
+    let dead_syms =
+        reader::get_dead_types(&db, workspace, path_prefix, None)?;
+
+    let dead_structs = dead_syms.iter().filter(|s| s.kind.to_string() == "struct").count();
+    let dead_enums = dead_syms.iter().filter(|s| s.kind.to_string() == "enum").count();
+    let dead_traits = dead_syms.iter().filter(|s| s.kind.to_string() == "trait").count();
+
+    // Dead by subsystem (2-level path prefix grouping)
+    let mut subsys_dead: HashMap<String, usize> = HashMap::new();
+    for s in &dead_syms {
+        let prefix = subsystem_prefix(&s.file_path, 2);
+        *subsys_dead.entry(prefix).or_insert(0) += 1;
+    }
+    let mut by_subsystem: Vec<WsDeadSubsystem> = subsys_dead
+        .into_iter()
+        .map(|(path, dead_count)| WsDeadSubsystem { path, dead_count })
+        .collect();
+    by_subsystem.sort_by(|a, b| b.dead_count.cmp(&a.dead_count));
+    by_subsystem.truncate(10);
+
+    // Hotspots top 10
+    let hot_syms = reader::get_usage_hotspots(&db, workspace, path_prefix, 10)?;
+    let hotspots_top10: Vec<WsHotspot> = hot_syms
+        .into_iter()
+        .map(|s| WsHotspot { name: s.name, type_use_count: s.type_use_count })
+        .collect();
+
+    // Semantic duplicate clusters (strict + loose)
+    let strict_rows = reader::get_semantic_dup_rows(
+        &db,
+        reader::SemanticDupOptions {
+            workspace_id: workspace,
+            path_prefix,
+            kinds: Some(&struct_kinds_owned),
+            loose: false,
+        },
+    )?;
+    let loose_rows = reader::get_semantic_dup_rows(
+        &db,
+        reader::SemanticDupOptions {
+            workspace_id: workspace,
+            path_prefix,
+            kinds: Some(&struct_kinds_owned),
+            loose: true,
+        },
+    )?;
+
+    let (exact_count, exact_locations, biggest_strict) = summarise_dup_rows(strict_rows, 5);
+    let (loose_count, loose_locations, _) = summarise_dup_rows(loose_rows, 0);
+
+    // Estimated savings: (locations - group_count) * avg_lines_per_member
+    let avg_lines: usize = 15;
+    let estimated_lines_drop = exact_locations.saturating_sub(exact_count) * avg_lines;
+
+    // Role groups top (with synonyms)
+    let struct_syms =
+        reader::get_all_symbols_filtered(&db, workspace, path_prefix, Some(struct_kind_strs))?;
+    let mut canon_map: HashMap<String, (HashSet<String>, usize)> = HashMap::new();
+    for sym in &struct_syms {
+        let tokens = tokenize_name(&sym.name);
+        let mut seen: HashSet<String> = HashSet::new();
+        for t in &tokens {
+            let canon = canonical_label(t);
+            if seen.insert(canon.clone()) {
+                let e = canon_map.entry(canon).or_insert_with(|| (HashSet::new(), 0));
+                e.0.insert(t.clone());
+                e.1 += 1;
+            }
+        }
+    }
+    let mut role_groups_top: Vec<WsRoleGroup> = canon_map
+        .into_iter()
+        .filter(|(_, (_, sz))| *sz >= 3)
+        .map(|(canonical_token, (raw_set, size))| {
+            let mut raw_tokens: Vec<String> = raw_set.into_iter().collect();
+            raw_tokens.sort();
+            WsRoleGroup { canonical_token, size, raw_tokens }
+        })
+        .collect();
+    role_groups_top.sort_by(|a, b| b.size.cmp(&a.size).then(a.canonical_token.cmp(&b.canonical_token)));
+    role_groups_top.truncate(10);
+
+    let resp = WorkspaceSummaryResponse {
+        totals: WsTotals {
+            files: n_files,
+            symbols: all_syms.len(),
+            structs: n_structs,
+            enums: n_enums,
+            traits: n_traits,
+            type_aliases: n_aliases,
+            modules: n_modules,
+            functions: n_functions,
+        },
+        dead: WsDead {
+            structs: dead_structs,
+            enums: dead_enums,
+            traits: dead_traits,
+            by_subsystem,
+        },
+        hotspots_top10,
+        duplicate_clusters: WsDuplicates {
+            exact_count,
+            loose_count,
+            biggest_strict,
+        },
+        role_groups_top,
+        potential_savings: WsPotentialSavings {
+            exact_dup_locations: exact_locations,
+            loose_dup_locations: loose_locations,
+            estimated_lines_drop,
+        },
+    };
+    Ok(Json(serde_json::json!(resp)))
+}
+
+/// Extract a 1- or 2-level path prefix from a file_path string.
+/// E.g. "ui/animation/recipes/foo.rs" → "ui/animation/" (depth=2).
+fn subsystem_prefix(file_path: &str, depth: usize) -> String {
+    // Normalise separators
+    let normed: String = file_path.replace('\\', "/");
+    let parts: Vec<&str> = normed.splitn(depth + 1, '/').collect();
+    if parts.len() <= depth {
+        normed
+    } else {
+        parts[..depth].join("/") + "/"
+    }
+}
+
+/// Group semantic dup rows by fingerprint; return (group_count, total_locations, top_N biggest).
+fn summarise_dup_rows(
+    rows: Vec<reader::SemanticDupRow>,
+    top_n: usize,
+) -> (usize, usize, Vec<WsBiggestDupGroup>) {
+    let mut fp_map: HashMap<String, (Option<String>, Vec<String>)> = HashMap::new();
+    for row in rows {
+        let e = fp_map
+            .entry(row.shape_fingerprint.clone())
+            .or_insert_with(|| (row.shape_summary.clone(), Vec::new()));
+        if e.0.is_none() {
+            e.0 = row.shape_summary;
+        }
+        e.1.push(row.name);
+    }
+
+    // Filter: need >=2 distinct names
+    let mut groups: Vec<(String, Option<String>, Vec<String>)> = fp_map
+        .into_iter()
+        .filter_map(|(fp, (summary, names))| {
+            let unique: HashSet<String> = names.iter().cloned().collect();
+            if unique.len() >= 2 {
+                let mut sorted: Vec<String> = unique.into_iter().collect();
+                sorted.sort();
+                Some((fp, summary, sorted))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let total_locations: usize = groups.iter().map(|(_, _, names)| names.len()).sum();
+    let group_count = groups.len();
+
+    groups.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
+
+    let biggest: Vec<WsBiggestDupGroup> = groups
+        .into_iter()
+        .take(top_n)
+        .map(|(_fp, summary, names)| {
+            let names_count = names.len();
+            WsBiggestDupGroup {
+                shape_summary: summary.unwrap_or_default(),
+                names_count,
+                members: names,
+            }
+        })
+        .collect();
+
+    (group_count, total_locations, biggest)
+}
+
+// ---------------------------------------------------------------------------
+// /ast/cleanup_plan — prioritised list of cleanup actions
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CleanupPlanQuery {
+    workspace: String,
+    path_prefix: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct CleanupAction {
+    priority: usize,
+    kind: &'static str,
+    description: String,
+    members: Vec<String>,
+    estimated_savings_lines: usize,
+}
+
+#[derive(Serialize)]
+struct CleanupPlanResponse {
+    plan: Vec<CleanupAction>,
+}
+
+async fn cleanup_plan(
+    State(state): State<SharedState>,
+    Query(params): Query<CleanupPlanQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let workspace = &params.workspace;
+    let path_prefix = params.path_prefix.as_deref();
+    let limit = params.limit.unwrap_or(20);
+
+    let struct_kind_strs: &[&str] = &["struct", "enum", "trait", "type_alias"];
+    let struct_kinds_owned: Vec<String> =
+        struct_kind_strs.iter().map(|s| (*s).to_owned()).collect();
+
+    // --- 1. Exact duplicate groups ---
+    let strict_rows = reader::get_semantic_dup_rows(
+        &db,
+        reader::SemanticDupOptions {
+            workspace_id: workspace,
+            path_prefix,
+            kinds: Some(&struct_kinds_owned),
+            loose: false,
+        },
+    )?;
+
+    let mut fp_strict: HashMap<String, (Option<String>, Vec<String>)> = HashMap::new();
+    for row in strict_rows {
+        let e = fp_strict
+            .entry(row.shape_fingerprint.clone())
+            .or_insert_with(|| (row.shape_summary.clone(), Vec::new()));
+        if e.0.is_none() {
+            e.0 = row.shape_summary;
+        }
+        e.1.push(row.name);
+    }
+
+    let mut actions: Vec<CleanupAction> = Vec::new();
+
+    for (_, (summary, names)) in fp_strict {
+        let unique: HashSet<String> = names.iter().cloned().collect();
+        if unique.len() < 2 {
+            continue;
+        }
+        let mut sorted: Vec<String> = unique.into_iter().collect();
+        sorted.sort();
+        let savings = sorted.len().saturating_sub(1) * 15;
+        let desc = format!(
+            "{} newtype({}) — collapse to one canonical",
+            sorted.len(),
+            summary.as_deref().unwrap_or("?"),
+        );
+        actions.push(CleanupAction {
+            priority: 0, // filled in later
+            kind: "exact_duplicate_collapse",
+            description: desc,
+            members: sorted,
+            estimated_savings_lines: savings,
+        });
+    }
+
+    // Sort exact dups by savings desc
+    actions.sort_by(|a, b| b.estimated_savings_lines.cmp(&a.estimated_savings_lines));
+
+    // --- 2. Dead subsystems ---
+    let dead_syms = reader::get_dead_types(&db, workspace, path_prefix, None)?;
+    let mut subsys_dead: HashMap<String, Vec<String>> = HashMap::new();
+    for s in &dead_syms {
+        let prefix = subsystem_prefix(&s.file_path, 3);
+        subsys_dead.entry(prefix).or_default().push(s.name.clone());
+    }
+    let mut dead_subsys_actions: Vec<CleanupAction> = subsys_dead
+        .into_iter()
+        .filter(|(_, names)| names.len() >= 5)
+        .map(|(path, mut names)| {
+            names.sort();
+            let cnt = names.len();
+            let savings = cnt * 15;
+            let desc = format!("{path} — {cnt} unused types");
+            CleanupAction {
+                priority: 0,
+                kind: "dead_subsystem_remove",
+                description: desc,
+                members: names,
+                estimated_savings_lines: savings,
+            }
+        })
+        .collect();
+    dead_subsys_actions.sort_by(|a, b| b.estimated_savings_lines.cmp(&a.estimated_savings_lines));
+
+    // --- 3. Synonym role consolidation ---
+    let struct_syms =
+        reader::get_all_symbols_filtered(&db, workspace, path_prefix, Some(struct_kind_strs))?;
+    let mut canon_map: HashMap<String, (HashSet<String>, usize)> = HashMap::new();
+    for sym in &struct_syms {
+        let tokens = tokenize_name(&sym.name);
+        let mut seen: HashSet<String> = HashSet::new();
+        for t in &tokens {
+            let canon = canonical_label(t);
+            if seen.insert(canon.clone()) {
+                let e = canon_map.entry(canon).or_insert_with(|| (HashSet::new(), 0));
+                e.0.insert(t.clone());
+                e.1 += 1;
+            }
+        }
+    }
+    let mut synonym_actions: Vec<CleanupAction> = canon_map
+        .into_iter()
+        .filter(|(_, (raw_set, sz))| *sz >= 5 && raw_set.len() >= 2)
+        .map(|(canonical, (raw_set, sz))| {
+            let mut raw_tokens: Vec<String> = raw_set.into_iter().collect();
+            raw_tokens.sort();
+            let desc = format!(
+                "{} — unify under one token (raw: {})",
+                canonical,
+                raw_tokens.join(", ")
+            );
+            let savings = sz.saturating_sub(1) * 5; // rough: consolidate naming effort
+            CleanupAction {
+                priority: 0,
+                kind: "synonym_role_consolidate",
+                description: desc,
+                members: raw_tokens,
+                estimated_savings_lines: savings,
+            }
+        })
+        .collect();
+    synonym_actions.sort_by(|a, b| b.estimated_savings_lines.cmp(&a.estimated_savings_lines));
+
+    // Merge all in priority order
+    let mut all_actions: Vec<CleanupAction> = Vec::new();
+    all_actions.extend(actions);
+    all_actions.extend(dead_subsys_actions);
+    all_actions.extend(synonym_actions);
+    all_actions.truncate(limit);
+
+    // Assign sequential priority numbers
+    for (i, action) in all_actions.iter_mut().enumerate() {
+        action.priority = i + 1;
+    }
+
+    let resp = CleanupPlanResponse { plan: all_actions };
     Ok(Json(serde_json::json!(resp)))
 }
 

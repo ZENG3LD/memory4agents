@@ -50,10 +50,33 @@ curl -X POST "http://127.0.0.1:18200/index" \
 | `/ast/dead_types?workspace=ID&path_prefix=P&kind=struct` | All symbols with `type_use_count=0 AND callsite_count=0` (dead candidates; includes signature+body+use_decl edges). |
 | `/ast/usage_hotspots?workspace=ID&path_prefix=P&top=N` | Top-N types by `type_use_count` desc (most used as types across workspace). |
 | `/ast/orphans?workspace=ID&path_prefix=P&kind=struct&exclude_pub_use=true` | Strict dead: `type_use_count=0 AND callsite_count=0` AND no meaningful `type_use_edges` row. `exclude_pub_use=true` (default) means `pub_use_decl` re-exports don't count as real usage. |
-| `/ast/role_groups?workspace=ID&path_prefix=P&token=theme&min_size=3&kind=trait` | Group types by shared name tokens. `token` (optional): only return group for that token. `min_size` (optional, default 3). `kind` (optional). Returns groups sorted by size desc, members sorted by `type_use_count` desc. |
-| `/ast/find_twins?seed=NAME&workspace=ID&path_prefix=P` | Find types similar to seed by 4 heuristics: `exact_shape` (same strict fingerprint), `loose_shape` (same loose fingerprint, same kind), `shared_token` (overlapping name tokens, includes `shared_tokens` list), `similar_size` (same kind, field_count ±1). |
+| `/ast/role_groups?workspace=ID&path_prefix=P&token=theme&min_size=3&kind=trait&use_synonyms=false` | Group types by shared name tokens. `token` (optional): only return group for that token. `min_size` (optional, default 3). `kind` (optional). `use_synonyms=true`: merge synonym tokens under canonical (e.g. style+theme+skin → "style"); response shape changes to `{groups:[{canonical_token,raw_tokens,size,members}]}`. Without `use_synonyms` returns `{groups:[{token,size,members}]}`. |
+| `/ast/find_twins?seed=NAME&workspace=ID&path_prefix=P` | Find types similar to seed by 5 heuristics: `exact_shape` (same strict fingerprint), `loose_shape` (same loose fingerprint, same kind), `shared_token` (overlapping name tokens), `synonym_token` (tokens in same synonym group, includes `synonym_pair:[seed_tok,sym_tok]`), `similar_size` (same kind, field_count ±1). |
+| `/ast/workspace_summary?workspace=ID&path_prefix=P` | High-level workspace report: `totals` (files/symbols/structs/enums/traits/type_aliases/modules/functions), `dead` (dead struct/enum/trait counts + `by_subsystem` top-10), `hotspots_top10` (by type_use_count), `duplicate_clusters` (exact_count, loose_count, biggest_strict top-5), `role_groups_top` (top-10 by synonym-canonical size), `potential_savings` (exact_dup_locations, loose_dup_locations, estimated_lines_drop). |
+| `/ast/cleanup_plan?workspace=ID&path_prefix=P&limit=20` | Prioritised cleanup action list. Each action: `priority`, `kind` (exact_duplicate_collapse / dead_subsystem_remove / synonym_role_consolidate), `description`, `members`, `estimated_savings_lines`. Priority 1–N ordered by savings desc within each kind tier. Default limit 20. |
 | `/ast/parallel_systems?workspace=ID&path_prefix=P&min_size=N&mode=wcc` | `mode=wcc` (default): weakly-connected components of structural type graph + `parallel_candidates` by euclidean profile distance. `mode=token`: profile-clustering by semantic name tokens — `groups` + `candidate_pairs` with cosine similarity ≥ 0.7 and no shared members. |
 | `/health` | Server status + index stats |
+
+## Synonym token map (v0.2.9+)
+
+Static hardcoded groups in `src/ast/synonyms.rs`. 12 groups / 45 tokens covered:
+
+| Canonical | Synonyms |
+|-----------|----------|
+| style | theme, skin, appearance |
+| default | defaults |
+| state | status, data |
+| config | settings, options, spec, params |
+| view | render, display, draw |
+| id | key, handle, ref |
+| size | dim, extent, bounds |
+| event | msg, message, signal |
+| kind | type, variant, category |
+| builder | factory, maker, constructor |
+| action | command, op, operation |
+| input | control, trigger |
+
+Tokens not in any group are standalone (returned as-is by `canonical_label`).
 
 ## type_use_count sources (v0.2.8+)
 
