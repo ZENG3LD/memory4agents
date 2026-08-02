@@ -203,6 +203,7 @@ impl<'a> SymbolCtx<'a> {
             shape_fingerprint_loose: None,
             field_count: None,
             shape_summary: None,
+            impl_trait: None,
             callsite_count: 0,
             type_use_count: 0,
         }
