@@ -81,7 +81,7 @@ async fn get_ready(State(state): State<SharedState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::state::AppState;
+    use crate::server::state::{with_db, AppError, AppState};
     use crate::server::stats::StatsCache;
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::Instant;
@@ -128,5 +128,51 @@ mod tests {
         );
 
         hold_task.await.expect("hold task must not panic");
+    }
+
+    /// `/health` must stay responsive even when many concurrent "slow
+    /// handler" calls — more than the runtime has worker threads — are all
+    /// going through `with_db`, the way `/ast`, `/graph` and `/usage`
+    /// routes do since their conversion off direct `state.db.lock()`.
+    ///
+    /// The runtime here is pinned to 2 worker threads; 8 concurrent slow
+    /// `with_db` calls (each blocking a spawn_blocking thread, not a
+    /// worker) must not stop `/health` from answering promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_answers_under_many_concurrent_slow_handlers() {
+        let state = test_state();
+        const CONCURRENT_SLOW_CALLS: usize = 8;
+
+        let mut slow_tasks = Vec::with_capacity(CONCURRENT_SLOW_CALLS);
+        for _ in 0..CONCURRENT_SLOW_CALLS {
+            let state = state.clone();
+            slow_tasks.push(tokio::spawn(async move {
+                with_db(&state, |_conn| {
+                    std::thread::sleep(Duration::from_millis(200));
+                    Ok::<(), AppError>(())
+                })
+                .await
+            }));
+        }
+
+        // Let the slow tasks actually start contending for the DB mutex
+        // before probing /health.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let started = Instant::now();
+        let Json(status) = get_health(State(state.clone())).await;
+        let elapsed = started.elapsed();
+
+        assert!(status.ok);
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "/health took {elapsed:?} with {CONCURRENT_SLOW_CALLS} concurrent slow handlers in flight"
+        );
+
+        for task in slow_tasks {
+            task.await
+                .expect("slow handler task must not panic")
+                .expect("with_db must not error for a trivial closure");
+        }
     }
 }

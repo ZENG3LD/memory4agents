@@ -39,3 +39,26 @@ impl IntoResponse for AppError {
         (status, axum::Json(body)).into_response()
     }
 }
+
+/// Runs `f` against the database inside `spawn_blocking`, so the DB mutex is
+/// taken and released entirely on a blocking-pool thread — never held across
+/// an `.await`, and never locked directly on a tokio runtime worker thread.
+///
+/// This is the standard way every route handler in `server::routes` touches
+/// `state.db`; see `/index` (the original pattern) and `/ast`, `/graph`,
+/// `/usage` routes (converted to it).
+pub async fn with_db<T, F>(state: &SharedState, f: F) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Connection) -> Result<T, AppError> + Send + 'static,
+{
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = db
+            .lock()
+            .map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+        f(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("task join error: {e}")))?
+}

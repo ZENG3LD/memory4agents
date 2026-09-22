@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use crate::db::reader;
 use crate::search::trigram::fuzzy_search;
-use crate::server::state::{AppError, SharedState};
+use crate::server::state::{with_db, AppError, SharedState};
 use crate::types::Symbol;
 
 pub fn router() -> Router<SharedState> {
@@ -62,39 +62,51 @@ async fn search_symbols(
     State(state): State<SharedState>,
     Query(params): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let limit = params.limit.unwrap_or(50);
-    let results = fuzzy_search(&db, params.workspace.as_deref(), &params.q, limit, 0.1)?;
-    Ok(Json(serde_json::json!(results)))
+    let value = with_db(&state, move |db| {
+        let limit = params.limit.unwrap_or(50);
+        let results = fuzzy_search(db, params.workspace.as_deref(), &params.q, limit, 0.1)?;
+        Ok(serde_json::json!(results))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 async fn symbols_in_file(
     State(state): State<SharedState>,
     Query(params): Query<FileQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let workspace = params.workspace.as_deref().unwrap_or("");
-    let results = reader::get_symbols_in_file(&db, workspace, &params.file)?;
-    Ok(Json(serde_json::json!(results)))
+    let value = with_db(&state, move |db| {
+        let workspace = params.workspace.as_deref().unwrap_or("");
+        let results = reader::get_symbols_in_file(db, workspace, &params.file)?;
+        Ok(serde_json::json!(results))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 async fn callers_of_symbol(
     State(state): State<SharedState>,
     Query(params): Query<SymQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let results = reader::get_callers_of(&db, &params.sym, params.workspace.as_deref())?;
-    Ok(Json(serde_json::json!(results)))
+    let value = with_db(&state, move |db| {
+        let results = reader::get_callers_of(db, &params.sym, params.workspace.as_deref())?;
+        Ok(serde_json::json!(results))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 async fn file_deps(
     State(state): State<SharedState>,
     Query(params): Query<FileQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let workspace = params.workspace.as_deref().unwrap_or("");
-    let results = reader::get_deps_of_file(&db, workspace, &params.file)?;
-    Ok(Json(serde_json::json!(results)))
+    let value = with_db(&state, move |db| {
+        let workspace = params.workspace.as_deref().unwrap_or("");
+        let results = reader::get_deps_of_file(db, workspace, &params.file)?;
+        Ok(serde_json::json!(results))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -288,77 +300,83 @@ async fn duplicates_of_name(
     State(state): State<SharedState>,
     Query(params): Query<DuplicatesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let symbols = reader::get_symbols_by_name(
-        &db,
-        &params.name,
-        params.workspace.as_deref(),
-        params.kind.as_deref(),
-    )?;
-    let total = symbols.len();
-    let groups = classify_symbols(symbols);
-    let resp = DuplicatesResponse {
-        name: params.name,
-        workspace: params.workspace,
-        groups,
-        total_locations: total,
-    };
-    Ok(Json(serde_json::json!(resp)))
+    let value = with_db(&state, move |db| {
+        let symbols = reader::get_symbols_by_name(
+            db,
+            &params.name,
+            params.workspace.as_deref(),
+            params.kind.as_deref(),
+        )?;
+        let total = symbols.len();
+        let groups = classify_symbols(symbols);
+        let resp = DuplicatesResponse {
+            name: params.name,
+            workspace: params.workspace,
+            groups,
+            total_locations: total,
+        };
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 async fn all_duplicates(
     State(state): State<SharedState>,
     Query(params): Query<AllDuplicatesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let min_count = params.min_count.unwrap_or(2);
-    let name_kind_totals = reader::get_duplicate_names(
-        &db,
-        &params.workspace,
-        min_count,
-        params.kind.as_deref(),
-    )?;
-
-    let mut duplicates: Vec<AllDuplicateEntry> = Vec::new();
-
-    for (name, kind, total) in name_kind_totals {
-        // Fetch symbols to classify
-        let symbols = reader::get_symbols_by_name(
-            &db,
-            &name,
-            Some(&params.workspace),
-            Some(&kind),
+    let value = with_db(&state, move |db| {
+        let min_count = params.min_count.unwrap_or(2);
+        let name_kind_totals = reader::get_duplicate_names(
+            db,
+            &params.workspace,
+            min_count,
+            params.kind.as_deref(),
         )?;
-        let groups = classify_symbols(symbols);
 
-        let mut exact_groups = 0usize;
-        let mut structural_groups = 0usize;
-        let mut name_only_count = 0usize;
+        let mut duplicates: Vec<AllDuplicateEntry> = Vec::new();
 
-        for g in &groups {
-            match g.classification {
-                "exact" => exact_groups += 1,
-                "structural" => structural_groups += 1,
-                _ => name_only_count += g.members.len(),
+        for (name, kind, total) in name_kind_totals {
+            // Fetch symbols to classify
+            let symbols = reader::get_symbols_by_name(
+                db,
+                &name,
+                Some(&params.workspace),
+                Some(&kind),
+            )?;
+            let groups = classify_symbols(symbols);
+
+            let mut exact_groups = 0usize;
+            let mut structural_groups = 0usize;
+            let mut name_only_count = 0usize;
+
+            for g in &groups {
+                match g.classification {
+                    "exact" => exact_groups += 1,
+                    "structural" => structural_groups += 1,
+                    _ => name_only_count += g.members.len(),
+                }
             }
+
+            duplicates.push(AllDuplicateEntry {
+                name,
+                kind,
+                total,
+                exact_groups,
+                structural_groups,
+                name_only_count,
+            });
         }
 
-        duplicates.push(AllDuplicateEntry {
-            name,
-            kind,
-            total,
-            exact_groups,
-            structural_groups,
-            name_only_count,
-        });
-    }
-
-    // Already sorted by total desc from SQL
-    let resp = AllDuplicatesResponse {
-        workspace: params.workspace,
-        duplicates,
-    };
-    Ok(Json(serde_json::json!(resp)))
+        // Already sorted by total desc from SQL
+        let resp = AllDuplicatesResponse {
+            workspace: params.workspace,
+            duplicates,
+        };
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +429,7 @@ async fn semantic_duplicates(
     State(state): State<SharedState>,
     Query(params): Query<SemanticDuplicatesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let value = with_db(&state, move |db| {
     let min_names = params.min_names.unwrap_or(1);
     let min_locations = params.min_locations.unwrap_or(2);
     let use_loose = params.loose.unwrap_or(false);
@@ -428,7 +446,7 @@ async fn semantic_duplicates(
     });
 
     let rows = reader::get_semantic_dup_rows(
-        &db,
+        db,
         reader::SemanticDupOptions {
             workspace_id: &params.workspace,
             path_prefix: params.path_prefix.as_deref(),
@@ -525,7 +543,10 @@ async fn semantic_duplicates(
         total_groups,
         groups,
     };
-    Ok(Json(serde_json::json!(resp)))
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -561,29 +582,32 @@ async fn impls_of_trait(
     State(state): State<SharedState>,
     Query(params): Query<ImplsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let symbols = reader::get_impls_of_trait(
-        &db,
-        &params.workspace,
-        &params.trait_name,
-        params.path_prefix.as_deref(),
-    )?;
-    let total = symbols.len();
-    let implementors: Vec<ImplementorEntry> = symbols
-        .into_iter()
-        .map(|s| ImplementorEntry {
-            type_name: s.name,
-            file: s.file_path,
-            line: s.line,
-            impl_id: s.id,
-        })
-        .collect();
-    let resp = ImplsResponse {
-        trait_name: params.trait_name,
-        implementors,
-        total,
-    };
-    Ok(Json(serde_json::json!(resp)))
+    let value = with_db(&state, move |db| {
+        let symbols = reader::get_impls_of_trait(
+            db,
+            &params.workspace,
+            &params.trait_name,
+            params.path_prefix.as_deref(),
+        )?;
+        let total = symbols.len();
+        let implementors: Vec<ImplementorEntry> = symbols
+            .into_iter()
+            .map(|s| ImplementorEntry {
+                type_name: s.name,
+                file: s.file_path,
+                line: s.line,
+                impl_id: s.id,
+            })
+            .collect();
+        let resp = ImplsResponse {
+            trait_name: params.trait_name,
+            implementors,
+            total,
+        };
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -617,37 +641,40 @@ async fn inherent_impls_of_type(
     State(state): State<SharedState>,
     Query(params): Query<InherentImplsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let impl_syms = reader::get_inherent_impls_of_type(
-        &db,
-        &params.workspace,
-        &params.type_name,
-        params.path_prefix.as_deref(),
-    )?;
+    let value = with_db(&state, move |db| {
+        let impl_syms = reader::get_inherent_impls_of_type(
+            db,
+            &params.workspace,
+            &params.type_name,
+            params.path_prefix.as_deref(),
+        )?;
 
-    let mut impls: Vec<InherentImplEntry> = Vec::new();
-    for sym in impl_syms {
-        // Count methods/functions whose parent_name == sym.name in the same file.
-        let count: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM symbols WHERE workspace_id = ?1 AND file_path = ?2 AND parent_name = ?3 AND kind IN ('function','async_function','method')",
-                rusqlite::params![sym.workspace_id, sym.file_path, sym.name],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        impls.push(InherentImplEntry {
-            file: sym.file_path,
-            line: sym.line,
-            impl_id: sym.id,
-            method_count: count as u32,
-        });
-    }
+        let mut impls: Vec<InherentImplEntry> = Vec::new();
+        for sym in impl_syms {
+            // Count methods/functions whose parent_name == sym.name in the same file.
+            let count: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE workspace_id = ?1 AND file_path = ?2 AND parent_name = ?3 AND kind IN ('function','async_function','method')",
+                    rusqlite::params![sym.workspace_id, sym.file_path, sym.name],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            impls.push(InherentImplEntry {
+                file: sym.file_path,
+                line: sym.line,
+                impl_id: sym.id,
+                method_count: count as u32,
+            });
+        }
 
-    let resp = InherentImplsResponse {
-        type_name: params.type_name,
-        impls,
-    };
-    Ok(Json(serde_json::json!(resp)))
+        let resp = InherentImplsResponse {
+            type_name: params.type_name,
+            impls,
+        };
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -676,16 +703,19 @@ async fn impl_summary(
     State(state): State<SharedState>,
     Query(params): Query<ImplSummaryQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let rows = reader::get_impl_summary(&db, &params.workspace, params.path_prefix.as_deref())?;
-    let traits: Vec<TraitImplSummaryEntry> = rows
-        .into_iter()
-        .map(|r| TraitImplSummaryEntry {
-            name: r.trait_name,
-            implementor_count: r.implementor_count,
-            implementors: r.implementors,
-        })
-        .collect();
-    let resp = ImplSummaryResponse { traits };
-    Ok(Json(serde_json::json!(resp)))
+    let value = with_db(&state, move |db| {
+        let rows = reader::get_impl_summary(db, &params.workspace, params.path_prefix.as_deref())?;
+        let traits: Vec<TraitImplSummaryEntry> = rows
+            .into_iter()
+            .map(|r| TraitImplSummaryEntry {
+                name: r.trait_name,
+                implementor_count: r.implementor_count,
+                implementors: r.implementors,
+            })
+            .collect();
+        let resp = ImplSummaryResponse { traits };
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }

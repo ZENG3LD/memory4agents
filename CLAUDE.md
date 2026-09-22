@@ -8,6 +8,7 @@
 - **Agent access**: Only agents with Bash + `permissionMode: default` can curl. WebFetch doesn't reach localhost (runs on Anthropic servers). Agents with `dontAsk` don't get Bash even if listed in tools.
 - **Dedicated agent**: `refactoring-explorer` — deep analysis agent with Bash+Grep+Read, 200 turns. Use ONLY when task touches 2+ crates (cross-crate deps, impact analysis). For simple exploration use regular `explorer`.
 - **New agents need IDE restart** to register.
+- **DB access from a route handler**: always `crate::server::state::with_db(&state, move |conn| { ... })` — runs the closure in `spawn_blocking` and takes/releases the `state.db` mutex entirely inside it. Never `state.db.lock()` directly inside an `async fn` handler (that locks/queries on a tokio worker thread and can starve other routes). `/health` is the one exception: it never touches `state.db` at all, see below.
 
 ## Starting the server
 

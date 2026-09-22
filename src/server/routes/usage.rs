@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::ast::known_types::{extract_type_names, tokenize_name};
 use crate::ast::synonyms::{canonical_label, synonym_group};
 use crate::db::reader;
-use crate::server::state::{AppError, SharedState};
+use crate::server::state::{with_db, AppError, SharedState};
 use crate::types::Symbol;
 
 pub fn router() -> Router<SharedState> {
@@ -81,14 +81,14 @@ async fn cluster(
     State(state): State<SharedState>,
     Query(params): Query<ClusterQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let value = with_db(&state, move |db| {
     let max_depth = params.depth.unwrap_or(2).min(4);
     let include_dead = params.include_dead.unwrap_or(true);
     let workspace = &params.workspace;
 
     // Load all structural symbols for fast lookup by name.
     let type_kinds: &[&str] = &["struct", "enum", "trait", "type_alias", "function", "async_function", "method", "class", "interface"];
-    let all_syms = reader::get_all_symbols_filtered(&db, workspace, params.path_prefix.as_deref(), Some(type_kinds))?;
+    let all_syms = reader::get_all_symbols_filtered(db, workspace, params.path_prefix.as_deref(), Some(type_kinds))?;
 
     // Build name → Vec<Symbol> index.
     let mut by_name: HashMap<String, Vec<Symbol>> = HashMap::new();
@@ -145,7 +145,7 @@ async fn cluster(
         }
 
         // Get callers via DB.
-        let callers = reader::get_callers_of(&db, &current_name, Some(workspace))?;
+        let callers = reader::get_callers_of(db, &current_name, Some(workspace))?;
         for caller in callers {
             let key = (caller.name.clone(), current_name.clone(), "uses");
             if edge_set.insert(key) {
@@ -192,7 +192,10 @@ async fn cluster(
         edges,
         stats: ClusterStats { total_nodes, total_edges, dead_node_count, depth_reached },
     };
-    Ok(Json(serde_json::json!(resp)))
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -264,19 +267,19 @@ async fn parallel_systems(
     State(state): State<SharedState>,
     Query(params): Query<ParallelSystemsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let value = with_db(&state, move |db| {
     let min_size = params.min_size.unwrap_or(5);
     let workspace = &params.workspace;
     let mode = params.mode.as_deref().unwrap_or("wcc");
 
     if mode == "token" {
-        return parallel_systems_token(&db, workspace, params.path_prefix.as_deref(), min_size);
+        return parallel_systems_token(db, workspace, params.path_prefix.as_deref(), min_size);
     }
 
     // Load structural symbols only.
     let struct_kinds: &[&str] = &["struct", "enum", "trait", "type_alias"];
     let all_syms = reader::get_all_symbols_filtered(
-        &db,
+        db,
         workspace,
         params.path_prefix.as_deref(),
         Some(struct_kinds),
@@ -437,7 +440,10 @@ async fn parallel_systems(
     parallel_candidates.sort_by(|a, b| a.profile_distance.partial_cmp(&b.profile_distance).unwrap_or(std::cmp::Ordering::Equal));
 
     let resp = ParallelSystemsResponse { components, parallel_candidates };
-    Ok(Json(serde_json::json!(resp)))
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 fn parallel_systems_token(
@@ -445,7 +451,7 @@ fn parallel_systems_token(
     workspace: &str,
     path_prefix: Option<&str>,
     min_size: usize,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<serde_json::Value, AppError> {
     let struct_kinds: &[&str] = &["struct", "enum", "trait", "type_alias"];
     let all_syms = reader::get_all_symbols_filtered(db, workspace, path_prefix, Some(struct_kinds))?;
 
@@ -564,7 +570,7 @@ fn parallel_systems_token(
     candidate_pairs.sort_by(|a, b| b.similarity_score.partial_cmp(&a.similarity_score).unwrap_or(std::cmp::Ordering::Equal));
 
     let resp = ParallelSystemsTokenResponse { groups, candidate_pairs };
-    Ok(Json(serde_json::json!(resp)))
+    Ok(serde_json::json!(resp))
 }
 
 // ---------------------------------------------------------------------------
@@ -599,32 +605,35 @@ async fn dead_in_group(
     State(state): State<SharedState>,
     Query(params): Query<DeadInGroupQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let symbols =
-        reader::get_symbols_by_fingerprint(&db, &params.workspace, &params.fingerprint)?;
+    let value = with_db(&state, move |db| {
+        let symbols =
+            reader::get_symbols_by_fingerprint(db, &params.workspace, &params.fingerprint)?;
 
-    let dead_count = symbols.iter().filter(|s| s.callsite_count == 0).count();
-    let total = symbols.len();
+        let dead_count = symbols.iter().filter(|s| s.callsite_count == 0).count();
+        let total = symbols.len();
 
-    let members: Vec<DeadInGroupEntry> = symbols
-        .into_iter()
-        .map(|s| DeadInGroupEntry {
-            is_dead: s.callsite_count == 0,
-            name: s.name,
-            kind: s.kind.to_string(),
-            file: s.file_path,
-            line: s.line,
-            callsite_count: s.callsite_count,
-        })
-        .collect();
+        let members: Vec<DeadInGroupEntry> = symbols
+            .into_iter()
+            .map(|s| DeadInGroupEntry {
+                is_dead: s.callsite_count == 0,
+                name: s.name,
+                kind: s.kind.to_string(),
+                file: s.file_path,
+                line: s.line,
+                callsite_count: s.callsite_count,
+            })
+            .collect();
 
-    let resp = DeadInGroupResponse {
-        fingerprint: params.fingerprint,
-        total,
-        dead_count,
-        members,
-    };
-    Ok(Json(serde_json::json!(resp)))
+        let resp = DeadInGroupResponse {
+            fingerprint: params.fingerprint,
+            total,
+            dead_count,
+            members,
+        };
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -671,9 +680,9 @@ async fn type_usage(
     State(state): State<SharedState>,
     Query(params): Query<TypeUsageQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let value = with_db(&state, move |db| {
     let symbols = reader::get_symbols_by_name_prefix(
-        &db,
+        db,
         &params.workspace,
         &params.name,
         params.path_prefix.as_deref(),
@@ -682,7 +691,7 @@ async fn type_usage(
     let want_breakdown = params.breakdown.unwrap_or(false);
     let mut members: Vec<TypeUsageMember> = Vec::new();
     for sym in symbols {
-        let users_raw = reader::get_type_users(&db, &params.workspace, sym.id)?;
+        let users_raw = reader::get_type_users(db, &params.workspace, sym.id)?;
         let users_by_kind: Option<HashMap<String, usize>> = if want_breakdown {
             let mut map: HashMap<String, usize> = HashMap::new();
             for u in &users_raw {
@@ -715,7 +724,10 @@ async fn type_usage(
     }
 
     let resp = TypeUsageResponse { name: params.name, members };
-    Ok(Json(serde_json::json!(resp)))
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -748,28 +760,31 @@ async fn dead_types(
     State(state): State<SharedState>,
     Query(params): Query<DeadTypesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let symbols = reader::get_dead_types(
-        &db,
-        &params.workspace,
-        params.path_prefix.as_deref(),
-        params.kind.as_deref(),
-    )?;
+    let value = with_db(&state, move |db| {
+        let symbols = reader::get_dead_types(
+            db,
+            &params.workspace,
+            params.path_prefix.as_deref(),
+            params.kind.as_deref(),
+        )?;
 
-    let total = symbols.len();
-    let dead: Vec<DeadTypeEntry> = symbols
-        .into_iter()
-        .map(|s| DeadTypeEntry {
-            name: s.name,
-            kind: s.kind.to_string(),
-            file: s.file_path,
-            line: s.line,
-            field_count: s.field_count,
-        })
-        .collect();
+        let total = symbols.len();
+        let dead: Vec<DeadTypeEntry> = symbols
+            .into_iter()
+            .map(|s| DeadTypeEntry {
+                name: s.name,
+                kind: s.kind.to_string(),
+                file: s.file_path,
+                line: s.line,
+                field_count: s.field_count,
+            })
+            .collect();
 
-    let resp = DeadTypesResponse { total, dead };
-    Ok(Json(serde_json::json!(resp)))
+        let resp = DeadTypesResponse { total, dead };
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -802,29 +817,32 @@ async fn usage_hotspots(
     State(state): State<SharedState>,
     Query(params): Query<UsageHotspotsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let top = params.top.unwrap_or(50);
-    let symbols = reader::get_usage_hotspots(
-        &db,
-        &params.workspace,
-        params.path_prefix.as_deref(),
-        top,
-    )?;
+    let value = with_db(&state, move |db| {
+        let top = params.top.unwrap_or(50);
+        let symbols = reader::get_usage_hotspots(
+            db,
+            &params.workspace,
+            params.path_prefix.as_deref(),
+            top,
+        )?;
 
-    let hotspots: Vec<UsageHotspotEntry> = symbols
-        .into_iter()
-        .map(|s| UsageHotspotEntry {
-            name: s.name,
-            kind: s.kind.to_string(),
-            file: s.file_path,
-            line: s.line,
-            type_use_count: s.type_use_count,
-            callsite_count: s.callsite_count,
-        })
-        .collect();
+        let hotspots: Vec<UsageHotspotEntry> = symbols
+            .into_iter()
+            .map(|s| UsageHotspotEntry {
+                name: s.name,
+                kind: s.kind.to_string(),
+                file: s.file_path,
+                line: s.line,
+                type_use_count: s.type_use_count,
+                callsite_count: s.callsite_count,
+            })
+            .collect();
 
-    let resp = UsageHotspotsResponse { hotspots };
-    Ok(Json(serde_json::json!(resp)))
+        let resp = UsageHotspotsResponse { hotspots };
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -859,30 +877,33 @@ async fn orphans(
     State(state): State<SharedState>,
     Query(params): Query<OrphansQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let exclude_pub_use = params.exclude_pub_use.unwrap_or(true);
-    let symbols = reader::get_orphan_types(
-        &db,
-        &params.workspace,
-        params.path_prefix.as_deref(),
-        params.kind.as_deref(),
-        exclude_pub_use,
-    )?;
+    let value = with_db(&state, move |db| {
+        let exclude_pub_use = params.exclude_pub_use.unwrap_or(true);
+        let symbols = reader::get_orphan_types(
+            db,
+            &params.workspace,
+            params.path_prefix.as_deref(),
+            params.kind.as_deref(),
+            exclude_pub_use,
+        )?;
 
-    let total = symbols.len();
-    let orphans_list: Vec<OrphanEntry> = symbols
-        .into_iter()
-        .map(|s| OrphanEntry {
-            name: s.name,
-            kind: s.kind.to_string(),
-            file: s.file_path,
-            line: s.line,
-            field_count: s.field_count,
-        })
-        .collect();
+        let total = symbols.len();
+        let orphans_list: Vec<OrphanEntry> = symbols
+            .into_iter()
+            .map(|s| OrphanEntry {
+                name: s.name,
+                kind: s.kind.to_string(),
+                file: s.file_path,
+                line: s.line,
+                field_count: s.field_count,
+            })
+            .collect();
 
-    let resp = OrphansResponse { total, orphans: orphans_list };
-    Ok(Json(serde_json::json!(resp)))
+        let resp = OrphansResponse { total, orphans: orphans_list };
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -940,14 +961,14 @@ async fn role_groups(
     State(state): State<SharedState>,
     Query(params): Query<RoleGroupsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let value = with_db(&state, move |db| {
     let min_size = params.min_size.unwrap_or(3);
     let workspace = &params.workspace;
     let use_synonyms = params.use_synonyms.unwrap_or(false);
 
     let kind_filter: &[&str] = &["struct", "enum", "trait", "type_alias"];
     let all_syms = reader::get_all_symbols_filtered(
-        &db,
+        db,
         workspace,
         params.path_prefix.as_deref(),
         Some(kind_filter),
@@ -1005,7 +1026,7 @@ async fn role_groups(
             .collect();
 
         groups.sort_by(|a, b| b.size.cmp(&a.size).then(a.canonical_token.cmp(&b.canonical_token)));
-        return Ok(Json(serde_json::json!(RoleGroupsSynonymResponse { groups })));
+        return Ok(serde_json::json!(RoleGroupsSynonymResponse { groups }));
     }
 
     // Build token → members map (raw token mode)
@@ -1047,7 +1068,10 @@ async fn role_groups(
     groups.sort_by(|a, b| b.size.cmp(&a.size).then(a.token.cmp(&b.token)));
 
     let resp = RoleGroupsResponse { groups };
-    Ok(Json(serde_json::json!(resp)))
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,13 +1147,13 @@ async fn find_twins(
     State(state): State<SharedState>,
     Query(params): Query<FindTwinsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let value = with_db(&state, move |db| {
     let workspace = &params.workspace;
 
     // Load the seed symbol(s)
     let kind_filter: &[&str] = &["struct", "enum", "trait", "type_alias"];
     let all_syms = reader::get_all_symbols_filtered(
-        &db,
+        db,
         workspace,
         params.path_prefix.as_deref(),
         Some(kind_filter),
@@ -1142,9 +1166,9 @@ async fn find_twins(
         .collect();
 
     if seed_syms.is_empty() {
-        return Ok(Json(serde_json::json!({
+        return Ok(serde_json::json!({
             "error": format!("seed '{}' not found", params.seed)
-        })));
+        }));
     }
 
     let seed = seed_syms[0];
@@ -1265,7 +1289,7 @@ async fn find_twins(
     // If seed is a trait, fetch all implementors.
     let implementors: Vec<ImplementorEntry> = if seed.kind == crate::types::SymbolKind::Trait {
         reader::get_impls_of_trait(
-            &db,
+            db,
             workspace,
             &params.seed,
             params.path_prefix.as_deref(),
@@ -1294,7 +1318,10 @@ async fn find_twins(
             implementors,
         },
     };
-    Ok(Json(serde_json::json!(resp)))
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1381,7 +1408,7 @@ async fn workspace_summary(
     State(state): State<SharedState>,
     Query(params): Query<WorkspaceSummaryQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let value = with_db(&state, move |db| {
     let workspace = &params.workspace;
     let path_prefix = params.path_prefix.as_deref();
 
@@ -1391,7 +1418,7 @@ async fn workspace_summary(
         "function", "async_function", "method",
     ];
     let all_syms =
-        reader::get_all_symbols_filtered(&db, workspace, path_prefix, Some(all_kinds))?;
+        reader::get_all_symbols_filtered(db, workspace, path_prefix, Some(all_kinds))?;
 
     // Count by kind
     let mut n_structs = 0usize;
@@ -1422,7 +1449,7 @@ async fn workspace_summary(
     let struct_kinds_owned: Vec<String> =
         struct_kind_strs.iter().map(|s| (*s).to_owned()).collect();
     let dead_syms =
-        reader::get_dead_types(&db, workspace, path_prefix, None)?;
+        reader::get_dead_types(db, workspace, path_prefix, None)?;
 
     let dead_structs = dead_syms.iter().filter(|s| s.kind.to_string() == "struct").count();
     let dead_enums = dead_syms.iter().filter(|s| s.kind.to_string() == "enum").count();
@@ -1442,7 +1469,7 @@ async fn workspace_summary(
     by_subsystem.truncate(10);
 
     // Hotspots top 10
-    let hot_syms = reader::get_usage_hotspots(&db, workspace, path_prefix, 10)?;
+    let hot_syms = reader::get_usage_hotspots(db, workspace, path_prefix, 10)?;
     let hotspots_top10: Vec<WsHotspot> = hot_syms
         .into_iter()
         .map(|s| WsHotspot { name: s.name, type_use_count: s.type_use_count })
@@ -1450,7 +1477,7 @@ async fn workspace_summary(
 
     // Semantic duplicate clusters (strict + loose)
     let strict_rows = reader::get_semantic_dup_rows(
-        &db,
+        db,
         reader::SemanticDupOptions {
             workspace_id: workspace,
             path_prefix,
@@ -1459,7 +1486,7 @@ async fn workspace_summary(
         },
     )?;
     let loose_rows = reader::get_semantic_dup_rows(
-        &db,
+        db,
         reader::SemanticDupOptions {
             workspace_id: workspace,
             path_prefix,
@@ -1477,7 +1504,7 @@ async fn workspace_summary(
 
     // Role groups top (with synonyms)
     let struct_syms =
-        reader::get_all_symbols_filtered(&db, workspace, path_prefix, Some(struct_kind_strs))?;
+        reader::get_all_symbols_filtered(db, workspace, path_prefix, Some(struct_kind_strs))?;
     let mut canon_map: HashMap<String, (HashSet<String>, usize)> = HashMap::new();
     for sym in &struct_syms {
         let tokens = tokenize_name(&sym.name);
@@ -1533,7 +1560,10 @@ async fn workspace_summary(
             estimated_lines_drop,
         },
     };
-    Ok(Json(serde_json::json!(resp)))
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 /// Extract a 1- or 2-level path prefix from a file_path string.
@@ -1630,7 +1660,7 @@ async fn cleanup_plan(
     State(state): State<SharedState>,
     Query(params): Query<CleanupPlanQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
+    let value = with_db(&state, move |db| {
     let workspace = &params.workspace;
     let path_prefix = params.path_prefix.as_deref();
     let limit = params.limit.unwrap_or(20);
@@ -1641,7 +1671,7 @@ async fn cleanup_plan(
 
     // --- 1. Exact duplicate groups ---
     let strict_rows = reader::get_semantic_dup_rows(
-        &db,
+        db,
         reader::SemanticDupOptions {
             workspace_id: workspace,
             path_prefix,
@@ -1689,7 +1719,7 @@ async fn cleanup_plan(
     actions.sort_by(|a, b| b.estimated_savings_lines.cmp(&a.estimated_savings_lines));
 
     // --- 2. Dead subsystems ---
-    let dead_syms = reader::get_dead_types(&db, workspace, path_prefix, None)?;
+    let dead_syms = reader::get_dead_types(db, workspace, path_prefix, None)?;
     let mut subsys_dead: HashMap<String, Vec<String>> = HashMap::new();
     for s in &dead_syms {
         let prefix = subsystem_prefix(&s.file_path, 3);
@@ -1716,7 +1746,7 @@ async fn cleanup_plan(
 
     // --- 3. Synonym role consolidation ---
     let struct_syms =
-        reader::get_all_symbols_filtered(&db, workspace, path_prefix, Some(struct_kind_strs))?;
+        reader::get_all_symbols_filtered(db, workspace, path_prefix, Some(struct_kind_strs))?;
     let mut canon_map: HashMap<String, (HashSet<String>, usize)> = HashMap::new();
     for sym in &struct_syms {
         let tokens = tokenize_name(&sym.name);
@@ -1766,6 +1796,9 @@ async fn cleanup_plan(
     }
 
     let resp = CleanupPlanResponse { plan: all_actions };
-    Ok(Json(serde_json::json!(resp)))
+        Ok(serde_json::json!(resp))
+    })
+    .await?;
+    Ok(Json(value))
 }
 

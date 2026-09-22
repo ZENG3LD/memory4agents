@@ -6,7 +6,7 @@ use axum::{
 use serde::Deserialize;
 use std::collections::{HashSet, VecDeque};
 use crate::db::reader;
-use crate::server::state::{SharedState, AppError};
+use crate::server::state::{with_db, AppError, SharedState};
 
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -45,65 +45,77 @@ async fn list_crates(
     State(state): State<SharedState>,
     Query(params): Query<WorkspaceQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let nodes = reader::list_crate_nodes(&db, params.workspace.as_deref())?;
-    let edges = reader::list_crate_deps(&db, params.workspace.as_deref())?;
-    Ok(Json(serde_json::json!({ "nodes": nodes, "edges": edges })))
+    let value = with_db(&state, move |db| {
+        let nodes = reader::list_crate_nodes(db, params.workspace.as_deref())?;
+        let edges = reader::list_crate_deps(db, params.workspace.as_deref())?;
+        Ok(serde_json::json!({ "nodes": nodes, "edges": edges }))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 async fn files_in_crate(
     State(state): State<SharedState>,
     Query(params): Query<CrateQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let workspace = params.workspace.as_deref().unwrap_or("");
-    let result = reader::list_file_edges(&db, workspace, None)?;
-    // Filter to edges that belong to the requested crate by crate name prefix
-    let filtered: Vec<_> = result
-        .into_iter()
-        .filter(|e| {
-            e.from_file.contains(&params.crate_name) || e.to_file.contains(&params.crate_name)
-        })
-        .collect();
-    Ok(Json(serde_json::json!(filtered)))
+    let value = with_db(&state, move |db| {
+        let workspace = params.workspace.as_deref().unwrap_or("");
+        let result = reader::list_file_edges(db, workspace, None)?;
+        // Filter to edges that belong to the requested crate by crate name prefix
+        let filtered: Vec<_> = result
+            .into_iter()
+            .filter(|e| {
+                e.from_file.contains(&params.crate_name) || e.to_file.contains(&params.crate_name)
+            })
+            .collect();
+        Ok(serde_json::json!(filtered))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 async fn impact_analysis(
     State(state): State<SharedState>,
     Query(params): Query<FileQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let workspace = params.workspace.as_deref().unwrap_or("");
+    let value = with_db(&state, move |db| {
+        let workspace = params.workspace.as_deref().unwrap_or("");
 
-    // BFS over reverse file dependencies
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<String> = VecDeque::new();
-    queue.push_back(params.file.clone());
-    visited.insert(params.file.clone());
+        // BFS over reverse file dependencies
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        queue.push_back(params.file.clone());
+        visited.insert(params.file.clone());
 
-    while let Some(current) = queue.pop_front() {
-        let reverse_deps = reader::get_reverse_file_deps(&db, workspace, &current)?;
-        for dep in reverse_deps {
-            if visited.insert(dep.clone()) {
-                queue.push_back(dep);
+        while let Some(current) = queue.pop_front() {
+            let reverse_deps = reader::get_reverse_file_deps(db, workspace, &current)?;
+            for dep in reverse_deps {
+                if visited.insert(dep.clone()) {
+                    queue.push_back(dep);
+                }
             }
         }
-    }
 
-    // Remove the seed file itself from results — callers only want affected files
-    visited.remove(&params.file);
-    let affected: Vec<String> = visited.into_iter().collect();
-    Ok(Json(serde_json::json!({ "file": params.file, "affected": affected })))
+        // Remove the seed file itself from results — callers only want affected files
+        visited.remove(&params.file);
+        let affected: Vec<String> = visited.into_iter().collect();
+        Ok(serde_json::json!({ "file": params.file, "affected": affected }))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 async fn hotspots(
     State(state): State<SharedState>,
     Query(params): Query<HotspotsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let limit = params.limit.unwrap_or(20);
-    let result = reader::get_hotspots(&db, params.workspace.as_deref(), limit)?;
-    Ok(Json(serde_json::json!(result)))
+    let value = with_db(&state, move |db| {
+        let limit = params.limit.unwrap_or(20);
+        let result = reader::get_hotspots(db, params.workspace.as_deref(), limit)?;
+        Ok(serde_json::json!(result))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 #[derive(Deserialize)]
@@ -119,16 +131,19 @@ async fn resolve_symbol(
     State(state): State<SharedState>,
     Query(params): Query<ResolveQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db.lock().map_err(|_| AppError::Internal("db lock poisoned".into()))?;
-    let hits = reader::resolve_symbol_to_crate(&db, &params.workspace, &params.sym)?;
-    let results: Vec<serde_json::Value> = hits
-        .into_iter()
-        .map(|(sym, crate_node)| {
-            serde_json::json!({
-                "symbol": sym,
-                "crate": crate_node,
+    let value = with_db(&state, move |db| {
+        let hits = reader::resolve_symbol_to_crate(db, &params.workspace, &params.sym)?;
+        let results: Vec<serde_json::Value> = hits
+            .into_iter()
+            .map(|(sym, crate_node)| {
+                serde_json::json!({
+                    "symbol": sym,
+                    "crate": crate_node,
+                })
             })
-        })
-        .collect();
-    Ok(Json(serde_json::json!({ "sym": params.sym, "results": results })))
+            .collect();
+        Ok(serde_json::json!({ "sym": params.sym, "results": results }))
+    })
+    .await?;
+    Ok(Json(value))
 }
