@@ -1,11 +1,15 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use axum::response::{IntoResponse, Response};
 use axum::http::StatusCode;
+use crate::server::stats::StatsCache;
 use crate::CoreError;
 
 pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub data_dir: String,
+    /// Last known DB stats for `/health`, refreshed by a background task.
+    /// See [`crate::server::stats::spawn_stats_refresher`].
+    pub stats_cache: Arc<RwLock<StatsCache>>,
 }
 
 pub type SharedState = Arc<AppState>;

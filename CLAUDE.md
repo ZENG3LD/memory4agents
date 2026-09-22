@@ -58,7 +58,8 @@ curl -X POST "http://127.0.0.1:18200/index" \
 | `/ast/workspace_summary?workspace=ID&path_prefix=P` | High-level workspace report: `totals` (files/symbols/structs/enums/traits/type_aliases/modules/functions), `dead` (dead struct/enum/trait counts + `by_subsystem` top-10), `hotspots_top10` (by type_use_count), `duplicate_clusters` (exact_count, loose_count, biggest_strict top-5), `role_groups_top` (top-10 by synonym-canonical size), `potential_savings` (exact_dup_locations, loose_dup_locations, estimated_lines_drop). |
 | `/ast/cleanup_plan?workspace=ID&path_prefix=P&limit=20` | Prioritised cleanup action list. Each action: `priority`, `kind` (exact_duplicate_collapse / dead_subsystem_remove / synonym_role_consolidate), `description`, `members`, `estimated_savings_lines`. Priority 1–N ordered by savings desc within each kind tier. Default limit 20. |
 | `/ast/parallel_systems?workspace=ID&path_prefix=P&min_size=N&mode=wcc` | `mode=wcc` (default): weakly-connected components of structural type graph + `parallel_candidates` by euclidean profile distance. `mode=token`: profile-clustering by semantic name tokens — `groups` + `candidate_pairs` with cosine similarity ≥ 0.7 and no shared members. |
-| `/health` | Server status + index stats |
+| `/health` | Pure liveness probe — never touches the database. Returns the LAST KNOWN stats from an in-memory cache (`ok`, `db_path`, `workspace_count`, `symbol_count`, `file_count`, `stats_age_secs`), refreshed by a background task every 30s (`STATS_REFRESH_INTERVAL`, `src/server/stats.rs`). Answers instantly even while `/index` or a heavy `/ast`/`/graph`/`/usage` query holds the DB lock. |
+| `/ready` | Readiness probe — runs a bounded (3s) `SELECT 1` via `spawn_blocking`; `503` if the DB is currently unreachable/locked rather than hanging. |
 
 ## impl_trait tracking (v0.2.10+)
 

@@ -281,6 +281,12 @@ pub struct SearchHit {
 }
 
 /// Health status of the indexer.
+///
+/// This is a pure liveness answer: `workspace_count`/`symbol_count`/
+/// `file_count` are the LAST KNOWN values from a background cache, not a
+/// live database query — see `server::stats`. `stats_age_secs` tells the
+/// caller how stale those numbers are; `None` means no refresh has
+/// completed yet (e.g. right after server startup).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthStatus {
     pub ok: bool,
@@ -288,6 +294,9 @@ pub struct HealthStatus {
     pub workspace_count: u32,
     pub symbol_count: u32,
     pub file_count: u32,
+    /// Age in seconds of the cached stats above, or `None` if not yet refreshed.
+    #[serde(default)]
+    pub stats_age_secs: Option<u64>,
 }
 
 /// Aggregate statistics for a workspace.

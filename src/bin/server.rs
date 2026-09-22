@@ -1,9 +1,10 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use dig2memory::db::schema::init_schema;
 use dig2memory::server::config::Config;
 use dig2memory::server::state::{AppState, SharedState};
+use dig2memory::server::stats::{spawn_stats_refresher, StatsCache};
 use dig2memory::server::routes;
 
 #[tokio::main]
@@ -24,7 +25,10 @@ async fn main() {
     let state: SharedState = Arc::new(AppState {
         db: Arc::new(Mutex::new(conn)),
         data_dir: config.data_dir,
+        stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
     });
+
+    spawn_stats_refresher(state.clone());
 
     let app = routes::api_router(state);
 
