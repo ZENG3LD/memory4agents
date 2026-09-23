@@ -8,9 +8,10 @@ not just an AST index. The rename plan is
 
 - **Port**: 18200 (range 18200-18299)
 - **What today**: AST index + dependency graph + fuzzy search over entire
-  nemo workspace. Later phases (see the plan) add an MCP server, a SCIP
-  precise index, personalized-PageRank repo-map, a decision log, and a
-  hybrid BM25+vector retrieval core.
+  nemo workspace, served over plain HTTP and over MCP (`POST /mcp`, 8 tools —
+  see "MCP server" below). Later phases (see the plan) add a SCIP precise
+  index, personalized-PageRank repo-map, a decision log, and a hybrid
+  BM25+vector retrieval core.
 - **Stack**: tree-sitter (Rust/TS/Python/Go grammars), SQLite (WAL), axum,
   cargo_metadata.
 - **Location**: this directory is still named `dig2memory/` on disk — the
@@ -157,6 +158,35 @@ curl -X POST "http://127.0.0.1:18200/index" \
 | `/ready` | Readiness probe — runs a bounded (3s) `SELECT 1` via `spawn_blocking`; `503` if the DB is currently unreachable/locked rather than hanging. |
 
 `POST /index` triggers indexing (see "Re-index" above).
+
+## MCP server (piece 1.1/1.2)
+
+`POST /mcp` (JSON-RPC 2.0, single or batch) is built on `nemo_service::mcp`
+(feature `mcp`), the same shared server `mail4agent` uses — no hand-written
+protocol code here. Exactly 8 tools, budget-capped by
+`nemo_service::mcp::Budget::WORKSPACE` (≤8 tools, ≤8 KB `tools/list`, ≤1.5 KB
+per tool) and asserted by a test (`server::routes::mcp::tests::eight_tools_within_the_workspace_mcp_budget`).
+Every tool dispatches into the exact `*_impl` function its HTTP sibling in
+`server::routes::{ast,graph,usage,index,health}` already calls — the same
+`with_db`/`AppState` seam, never a second code path. Because every route on
+this server is `auth: "none"` (binds to 127.0.0.1 only), the router is
+mounted with no auth layer, and `route_docs()`'s hardcoded `auth: "bearer"`
+is overwritten to `"none"` in `server::routes::build_router` before folding
+into the self-asserted manifest.
+
+| Tool | Replaces (REST) | Notes |
+|------|------------------|-------|
+| `mem_search` | `/ast/search` | `scope: "symbol"\|"code"` — trigram fuzzy name search. `scope: "docs"` refuses "not implemented until phase 5". |
+| `mem_symbol` | `/ast/duplicates`, `/ast/callers`, `/graph/impact_symbol`, `/ast/type_usage`, `/ast/impls`+`/ast/inherent_impls` | `what: "definition"\|"callers"\|"impact"\|"type_usage"\|"implementors"`. |
+| `mem_file` | `/ast/symbols?file=`, `/ast/deps`, `/graph/impact` | `what: "symbols"\|"deps"\|"impact"`. |
+| `mem_repo_map` | `/graph/hotspots` + `/graph/crates` | Degree-based rollup in phase 1; `focus` is accepted and echoed back but not yet used to bias ranking — personalized PageRank lands in phase 3. |
+| `mem_cleanup` | 13 dedup/dead-code endpoints across `ast.rs`/`usage.rs` | `what` selects one of 13 kinds (`cluster`, `parallel_systems`, `dead_in_group`, `dead_types`, `usage_hotspots`, `orphans`, `role_groups`, `find_twins`, `workspace_summary`, `cleanup_plan`, `duplicates`, `all_duplicates`, `semantic_duplicates`). A generic optional `arg` string carries whichever seed/fingerprint/name/token that `what` needs (named refusal if a required one is missing) — see `server::routes::mcp`'s own module doc. |
+| `mem_index` | `POST /index` | `action: "reindex"` fires `Indexer::run` via `tokio::spawn` (through `server::routes::index::spawn_reindex_job`) and returns immediately; `action: "status"` reads `AppState::last_index` (`crate::index::job::IndexJobStatus`) plus the `/health` stats cache. `POST /index` itself is unchanged — still synchronous, never touches `last_index`. |
+| `mem_decide` | — (new in phase 4) | Slot reserved; every call refuses with "not implemented yet" until phase 4's decision log lands. |
+| `mem_health` | `/health` | Same cached-stats snapshot (`server::routes::health::health_snapshot`), never queries the database. |
+
+Schemas are fixed for every later phase (cross-phase MCP tool ledger in the
+plan) — phase 2/3/4/5 upgrade a tool's handler only, never its shape.
 
 ## Crate graph (multi-manifest, piece 0.7)
 

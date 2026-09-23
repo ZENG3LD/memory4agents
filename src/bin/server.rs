@@ -52,6 +52,7 @@ async fn main() {
         data_dir: config.data_dir,
         stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
         index_locks: IndexLocks::new(),
+        last_index: Arc::new(RwLock::new(None)),
     });
 
     spawn_stats_refresher(state.clone());

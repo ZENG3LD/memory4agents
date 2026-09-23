@@ -53,3 +53,9 @@ nemo-service = { path = "../nemo-service", default-features = false, features = 
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+# `Router::oneshot` for driving the MCP route (`server::routes::mcp`) in
+# tests without a real listener — same dev-only use `nemo-service` and
+# `mail4agent` already make of this crate.
+tower = { version = "0.5", default-features = false, features = ["util"] }

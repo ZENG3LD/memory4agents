@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 use axum::response::{IntoResponse, Response};
 use axum::http::StatusCode;
+use crate::index::job::IndexJobStatus;
 use crate::index::lock::IndexLocks;
 use crate::server::stats::StatsCache;
 use crate::storage::{BatchWriter, DbPool};
@@ -24,6 +25,11 @@ pub struct AppState {
     /// `Indexer::run`/`run_changed_paths` call per workspace id at a time.
     /// See [`crate::index::lock::IndexLocks`].
     pub index_locks: IndexLocks,
+    /// Last known status of a `mem_index`-triggered background reindex job
+    /// (`server::routes::mcp`) — `None` until the first such job runs. A
+    /// synchronous `POST /index` call does not touch this. See
+    /// [`crate::index::job::IndexJobStatus`].
+    pub last_index: Arc<RwLock<Option<IndexJobStatus>>>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -123,6 +129,7 @@ mod tests {
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
+            last_index: Arc::new(RwLock::new(None)),
         });
 
         // Kick off a deliberately slow read on the pool (simulates a heavy

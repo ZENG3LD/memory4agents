@@ -427,6 +427,7 @@ mod tests {
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
+            last_index: Arc::new(RwLock::new(None)),
         });
         (state, path)
     }

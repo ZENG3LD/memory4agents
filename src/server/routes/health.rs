@@ -34,23 +34,29 @@ pub fn router() -> DocRouter<SharedState> {
         )
 }
 
-/// Pure liveness probe. Never queries the database and never blocks on a
+/// Pure liveness snapshot: never queries the database and never blocks on a
 /// lock a long-running request could be holding — it only reads the
 /// in-memory cache kept fresh by `server::stats::spawn_stats_refresher`.
-async fn get_health(State(state): State<SharedState>) -> Json<HealthStatus> {
+/// Shared by the `GET /health` route and the `mem_health` MCP tool
+/// (`server::routes::mcp`) — one code path for this capability.
+pub(crate) fn health_snapshot(state: &SharedState) -> HealthStatus {
     let cache = state
         .stats_cache
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let db_path = format!("{}/index.db", state.data_dir);
-    Json(HealthStatus {
+    HealthStatus {
         ok: cache.ok,
         db_path,
         workspace_count: cache.workspace_count,
         symbol_count: cache.symbol_count,
         file_count: cache.file_count,
         stats_age_secs: cache.age_secs(),
-    })
+    }
+}
+
+async fn get_health(State(state): State<SharedState>) -> Json<HealthStatus> {
+    Json(health_snapshot(&state))
 }
 
 #[derive(Serialize)]
@@ -114,6 +120,7 @@ mod tests {
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
+            last_index: Arc::new(RwLock::new(None)),
         })
     }
 
