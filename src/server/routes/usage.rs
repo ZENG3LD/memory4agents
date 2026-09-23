@@ -117,12 +117,12 @@ pub fn router() -> DocRouter<SharedState> {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct ClusterQuery {
-    seed: String,
-    workspace: String,
-    depth: Option<u32>,
-    path_prefix: Option<String>,
-    include_dead: Option<bool>,
+pub(crate) struct ClusterQuery {
+    pub(crate) seed: String,
+    pub(crate) workspace: String,
+    pub(crate) depth: Option<u32>,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) include_dead: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -162,11 +162,8 @@ struct ClusterResponse {
     stats: ClusterStats,
 }
 
-async fn cluster(
-    State(state): State<SharedState>,
-    Query(params): Query<ClusterQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn cluster_impl(state: &SharedState, params: ClusterQuery) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
     let max_depth = params.depth.unwrap_or(2).min(4);
     let include_dead = params.include_dead.unwrap_or(true);
     let workspace = &params.workspace;
@@ -279,8 +276,14 @@ async fn cluster(
     };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn cluster(
+    State(state): State<SharedState>,
+    Query(params): Query<ClusterQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(cluster_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -288,12 +291,12 @@ async fn cluster(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct ParallelSystemsQuery {
-    workspace: String,
-    path_prefix: Option<String>,
-    min_size: Option<usize>,
+pub(crate) struct ParallelSystemsQuery {
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) min_size: Option<usize>,
     /// "wcc" (weakly-connected components, default) or "token" (semantic token clustering)
-    mode: Option<String>,
+    pub(crate) mode: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -348,11 +351,11 @@ struct ParallelSystemsTokenResponse {
     candidate_pairs: Vec<TokenCandidatePair>,
 }
 
-async fn parallel_systems(
-    State(state): State<SharedState>,
-    Query(params): Query<ParallelSystemsQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn parallel_systems_impl(
+    state: &SharedState,
+    params: ParallelSystemsQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
     let min_size = params.min_size.unwrap_or(5);
     let workspace = &params.workspace;
     let mode = params.mode.as_deref().unwrap_or("wcc");
@@ -527,8 +530,14 @@ async fn parallel_systems(
     let resp = ParallelSystemsResponse { components, parallel_candidates };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn parallel_systems(
+    State(state): State<SharedState>,
+    Query(params): Query<ParallelSystemsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(parallel_systems_impl(&state, params).await?))
 }
 
 fn parallel_systems_token(
@@ -663,9 +672,9 @@ fn parallel_systems_token(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct DeadInGroupQuery {
-    fingerprint: String,
-    workspace: String,
+pub(crate) struct DeadInGroupQuery {
+    pub(crate) fingerprint: String,
+    pub(crate) workspace: String,
 }
 
 #[derive(Serialize)]
@@ -686,11 +695,11 @@ struct DeadInGroupResponse {
     members: Vec<DeadInGroupEntry>,
 }
 
-async fn dead_in_group(
-    State(state): State<SharedState>,
-    Query(params): Query<DeadInGroupQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn dead_in_group_impl(
+    state: &SharedState,
+    params: DeadInGroupQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let symbols =
             reader::get_symbols_by_fingerprint(db, &params.workspace, &params.fingerprint)?;
 
@@ -717,8 +726,14 @@ async fn dead_in_group(
         };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn dead_in_group(
+    State(state): State<SharedState>,
+    Query(params): Query<DeadInGroupQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(dead_in_group_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -726,11 +741,11 @@ async fn dead_in_group(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct TypeUsageQuery {
-    name: String,
-    workspace: String,
-    path_prefix: Option<String>,
-    breakdown: Option<bool>,
+pub(crate) struct TypeUsageQuery {
+    pub(crate) name: String,
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) breakdown: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -761,11 +776,11 @@ struct TypeUsageResponse {
     members: Vec<TypeUsageMember>,
 }
 
-async fn type_usage(
-    State(state): State<SharedState>,
-    Query(params): Query<TypeUsageQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn type_usage_impl(
+    state: &SharedState,
+    params: TypeUsageQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
     let symbols = reader::get_symbols_by_name_prefix(
         db,
         &params.workspace,
@@ -811,8 +826,14 @@ async fn type_usage(
     let resp = TypeUsageResponse { name: params.name, members };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn type_usage(
+    State(state): State<SharedState>,
+    Query(params): Query<TypeUsageQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(type_usage_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -820,10 +841,10 @@ async fn type_usage(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct DeadTypesQuery {
-    workspace: String,
-    path_prefix: Option<String>,
-    kind: Option<String>,
+pub(crate) struct DeadTypesQuery {
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -841,11 +862,11 @@ struct DeadTypesResponse {
     dead: Vec<DeadTypeEntry>,
 }
 
-async fn dead_types(
-    State(state): State<SharedState>,
-    Query(params): Query<DeadTypesQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn dead_types_impl(
+    state: &SharedState,
+    params: DeadTypesQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let symbols = reader::get_dead_types(
             db,
             &params.workspace,
@@ -868,8 +889,14 @@ async fn dead_types(
         let resp = DeadTypesResponse { total, dead };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn dead_types(
+    State(state): State<SharedState>,
+    Query(params): Query<DeadTypesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(dead_types_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -877,10 +904,10 @@ async fn dead_types(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct UsageHotspotsQuery {
-    workspace: String,
-    path_prefix: Option<String>,
-    top: Option<u32>,
+pub(crate) struct UsageHotspotsQuery {
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) top: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -898,11 +925,11 @@ struct UsageHotspotsResponse {
     hotspots: Vec<UsageHotspotEntry>,
 }
 
-async fn usage_hotspots(
-    State(state): State<SharedState>,
-    Query(params): Query<UsageHotspotsQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn usage_hotspots_impl(
+    state: &SharedState,
+    params: UsageHotspotsQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let top = params.top.unwrap_or(50);
         let symbols = reader::get_usage_hotspots(
             db,
@@ -926,8 +953,14 @@ async fn usage_hotspots(
         let resp = UsageHotspotsResponse { hotspots };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn usage_hotspots(
+    State(state): State<SharedState>,
+    Query(params): Query<UsageHotspotsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(usage_hotspots_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -935,12 +968,12 @@ async fn usage_hotspots(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct OrphansQuery {
-    workspace: String,
-    path_prefix: Option<String>,
-    kind: Option<String>,
+pub(crate) struct OrphansQuery {
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) kind: Option<String>,
     /// When true (default), pub_use_decl edges don't count as real usage.
-    exclude_pub_use: Option<bool>,
+    pub(crate) exclude_pub_use: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -958,11 +991,8 @@ struct OrphansResponse {
     orphans: Vec<OrphanEntry>,
 }
 
-async fn orphans(
-    State(state): State<SharedState>,
-    Query(params): Query<OrphansQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn orphans_impl(state: &SharedState, params: OrphansQuery) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let exclude_pub_use = params.exclude_pub_use.unwrap_or(true);
         let symbols = reader::get_orphan_types(
             db,
@@ -987,8 +1017,14 @@ async fn orphans(
         let resp = OrphansResponse { total, orphans: orphans_list };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn orphans(
+    State(state): State<SharedState>,
+    Query(params): Query<OrphansQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(orphans_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -996,14 +1032,14 @@ async fn orphans(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct RoleGroupsQuery {
-    workspace: String,
-    path_prefix: Option<String>,
-    token: Option<String>,
-    min_size: Option<usize>,
-    kind: Option<String>,
+pub(crate) struct RoleGroupsQuery {
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) token: Option<String>,
+    pub(crate) min_size: Option<usize>,
+    pub(crate) kind: Option<String>,
     /// When true, merge synonym tokens (style+theme+skin → canonical "style").
-    use_synonyms: Option<bool>,
+    pub(crate) use_synonyms: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -1042,11 +1078,11 @@ struct RoleGroupsSynonymResponse {
     groups: Vec<RoleGroupSynonym>,
 }
 
-async fn role_groups(
-    State(state): State<SharedState>,
-    Query(params): Query<RoleGroupsQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn role_groups_impl(
+    state: &SharedState,
+    params: RoleGroupsQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
     let min_size = params.min_size.unwrap_or(3);
     let workspace = &params.workspace;
     let use_synonyms = params.use_synonyms.unwrap_or(false);
@@ -1155,8 +1191,14 @@ async fn role_groups(
     let resp = RoleGroupsResponse { groups };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn role_groups(
+    State(state): State<SharedState>,
+    Query(params): Query<RoleGroupsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(role_groups_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,10 +1206,10 @@ async fn role_groups(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct FindTwinsQuery {
-    seed: String,
-    workspace: String,
-    path_prefix: Option<String>,
+pub(crate) struct FindTwinsQuery {
+    pub(crate) seed: String,
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1228,11 +1270,11 @@ struct FindTwinsDetail {
     implementors: Vec<ImplementorEntry>,
 }
 
-async fn find_twins(
-    State(state): State<SharedState>,
-    Query(params): Query<FindTwinsQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn find_twins_impl(
+    state: &SharedState,
+    params: FindTwinsQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
     let workspace = &params.workspace;
 
     // Load the seed symbol(s)
@@ -1405,8 +1447,14 @@ async fn find_twins(
     };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn find_twins(
+    State(state): State<SharedState>,
+    Query(params): Query<FindTwinsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(find_twins_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,9 +1462,9 @@ async fn find_twins(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct WorkspaceSummaryQuery {
-    workspace: String,
-    path_prefix: Option<String>,
+pub(crate) struct WorkspaceSummaryQuery {
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1489,11 +1537,11 @@ struct WorkspaceSummaryResponse {
     potential_savings: WsPotentialSavings,
 }
 
-async fn workspace_summary(
-    State(state): State<SharedState>,
-    Query(params): Query<WorkspaceSummaryQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn workspace_summary_impl(
+    state: &SharedState,
+    params: WorkspaceSummaryQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
     let workspace = &params.workspace;
     let path_prefix = params.path_prefix.as_deref();
 
@@ -1647,8 +1695,14 @@ async fn workspace_summary(
     };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn workspace_summary(
+    State(state): State<SharedState>,
+    Query(params): Query<WorkspaceSummaryQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(workspace_summary_impl(&state, params).await?))
 }
 
 /// Extract a 1- or 2-level path prefix from a file_path string.
@@ -1721,10 +1775,10 @@ fn summarise_dup_rows(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct CleanupPlanQuery {
-    workspace: String,
-    path_prefix: Option<String>,
-    limit: Option<usize>,
+pub(crate) struct CleanupPlanQuery {
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) limit: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -1741,11 +1795,11 @@ struct CleanupPlanResponse {
     plan: Vec<CleanupAction>,
 }
 
-async fn cleanup_plan(
-    State(state): State<SharedState>,
-    Query(params): Query<CleanupPlanQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn cleanup_plan_impl(
+    state: &SharedState,
+    params: CleanupPlanQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
     let workspace = &params.workspace;
     let path_prefix = params.path_prefix.as_deref();
     let limit = params.limit.unwrap_or(20);
@@ -1883,7 +1937,12 @@ async fn cleanup_plan(
     let resp = CleanupPlanResponse { plan: all_actions };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
 }
 
+async fn cleanup_plan(
+    State(state): State<SharedState>,
+    Query(params): Query<CleanupPlanQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(cleanup_plan_impl(&state, params).await?))
+}

@@ -70,87 +70,108 @@ pub fn router() -> DocRouter<SharedState> {
 }
 
 #[derive(Deserialize)]
-struct SearchQuery {
-    q: String,
-    workspace: Option<String>,
-    limit: Option<u32>,
+pub(crate) struct SearchQuery {
+    pub(crate) q: String,
+    pub(crate) workspace: Option<String>,
+    pub(crate) limit: Option<u32>,
 }
 
 #[derive(Deserialize)]
-struct FileQuery {
-    file: String,
-    workspace: Option<String>,
+pub(crate) struct FileQuery {
+    pub(crate) file: String,
+    pub(crate) workspace: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct SymQuery {
-    sym: String,
-    workspace: Option<String>,
+pub(crate) struct SymQuery {
+    pub(crate) sym: String,
+    pub(crate) workspace: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct DuplicatesQuery {
-    name: String,
-    workspace: Option<String>,
-    kind: Option<String>,
+pub(crate) struct DuplicatesQuery {
+    pub(crate) name: String,
+    pub(crate) workspace: Option<String>,
+    pub(crate) kind: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct AllDuplicatesQuery {
-    workspace: String,
-    min_count: Option<u32>,
-    kind: Option<String>,
+pub(crate) struct AllDuplicatesQuery {
+    pub(crate) workspace: String,
+    pub(crate) min_count: Option<u32>,
+    pub(crate) kind: Option<String>,
+}
+
+pub(crate) async fn search_symbols_impl(
+    state: &SharedState,
+    params: SearchQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
+        let limit = params.limit.unwrap_or(50);
+        let results = fuzzy_search(db, params.workspace.as_deref(), &params.q, limit, 0.1)?;
+        Ok(serde_json::json!(results))
+    })
+    .await
 }
 
 async fn search_symbols(
     State(state): State<SharedState>,
     Query(params): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
-        let limit = params.limit.unwrap_or(50);
-        let results = fuzzy_search(db, params.workspace.as_deref(), &params.q, limit, 0.1)?;
+    Ok(Json(search_symbols_impl(&state, params).await?))
+}
+
+pub(crate) async fn symbols_in_file_impl(
+    state: &SharedState,
+    params: FileQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
+        let workspace = params.workspace.as_deref().unwrap_or("");
+        let results = reader::get_symbols_in_file(db, workspace, &params.file)?;
         Ok(serde_json::json!(results))
     })
-    .await?;
-    Ok(Json(value))
+    .await
 }
 
 async fn symbols_in_file(
     State(state): State<SharedState>,
     Query(params): Query<FileQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
-        let workspace = params.workspace.as_deref().unwrap_or("");
-        let results = reader::get_symbols_in_file(db, workspace, &params.file)?;
+    Ok(Json(symbols_in_file_impl(&state, params).await?))
+}
+
+pub(crate) async fn callers_of_symbol_impl(
+    state: &SharedState,
+    params: SymQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
+        let results = reader::get_callers_of(db, &params.sym, params.workspace.as_deref())?;
         Ok(serde_json::json!(results))
     })
-    .await?;
-    Ok(Json(value))
+    .await
 }
 
 async fn callers_of_symbol(
     State(state): State<SharedState>,
     Query(params): Query<SymQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
-        let results = reader::get_callers_of(db, &params.sym, params.workspace.as_deref())?;
+    Ok(Json(callers_of_symbol_impl(&state, params).await?))
+}
+
+pub(crate) async fn file_deps_impl(state: &SharedState, params: FileQuery) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
+        let workspace = params.workspace.as_deref().unwrap_or("");
+        let results = reader::get_deps_of_file(db, workspace, &params.file)?;
         Ok(serde_json::json!(results))
     })
-    .await?;
-    Ok(Json(value))
+    .await
 }
 
 async fn file_deps(
     State(state): State<SharedState>,
     Query(params): Query<FileQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
-        let workspace = params.workspace.as_deref().unwrap_or("");
-        let results = reader::get_deps_of_file(db, workspace, &params.file)?;
-        Ok(serde_json::json!(results))
-    })
-    .await?;
-    Ok(Json(value))
+    Ok(Json(file_deps_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -340,11 +361,11 @@ fn classify_symbols(symbols: Vec<Symbol>) -> Vec<DuplicateGroup> {
     groups
 }
 
-async fn duplicates_of_name(
-    State(state): State<SharedState>,
-    Query(params): Query<DuplicatesQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn duplicates_of_name_impl(
+    state: &SharedState,
+    params: DuplicatesQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let symbols = reader::get_symbols_by_name(
             db,
             &params.name,
@@ -361,15 +382,21 @@ async fn duplicates_of_name(
         };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
 }
 
-async fn all_duplicates(
+async fn duplicates_of_name(
     State(state): State<SharedState>,
-    Query(params): Query<AllDuplicatesQuery>,
+    Query(params): Query<DuplicatesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+    Ok(Json(duplicates_of_name_impl(&state, params).await?))
+}
+
+pub(crate) async fn all_duplicates_impl(
+    state: &SharedState,
+    params: AllDuplicatesQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let min_count = params.min_count.unwrap_or(2);
         let name_kind_totals = reader::get_duplicate_names(
             db,
@@ -419,8 +446,14 @@ async fn all_duplicates(
         };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn all_duplicates(
+    State(state): State<SharedState>,
+    Query(params): Query<AllDuplicatesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(all_duplicates_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -428,20 +461,20 @@ async fn all_duplicates(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct SemanticDuplicatesQuery {
-    workspace: String,
-    path_prefix: Option<String>,
-    kind: Option<String>,
+pub(crate) struct SemanticDuplicatesQuery {
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) kind: Option<String>,
     /// Minimum distinct names in group (default 1).
-    min_names: Option<usize>,
+    pub(crate) min_names: Option<usize>,
     /// Minimum total locations in group (default 2).
-    min_locations: Option<usize>,
+    pub(crate) min_locations: Option<usize>,
     /// Use loose fingerprint (ignores field names / method names). Default false.
-    loose: Option<bool>,
+    pub(crate) loose: Option<bool>,
     /// Minimum field_count for a group (default 0).
-    min_fields: Option<u32>,
+    pub(crate) min_fields: Option<u32>,
     /// Maximum field_count for a group (default 999999).
-    max_fields: Option<u32>,
+    pub(crate) max_fields: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -469,11 +502,11 @@ struct SemanticDuplicatesResponse {
     groups: Vec<SemanticGroup>,
 }
 
-async fn semantic_duplicates(
-    State(state): State<SharedState>,
-    Query(params): Query<SemanticDuplicatesQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn semantic_duplicates_impl(
+    state: &SharedState,
+    params: SemanticDuplicatesQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
     let min_names = params.min_names.unwrap_or(1);
     let min_locations = params.min_locations.unwrap_or(2);
     let use_loose = params.loose.unwrap_or(false);
@@ -589,8 +622,14 @@ async fn semantic_duplicates(
     };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn semantic_duplicates(
+    State(state): State<SharedState>,
+    Query(params): Query<SemanticDuplicatesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(semantic_duplicates_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -598,11 +637,11 @@ async fn semantic_duplicates(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct ImplsQuery {
+pub(crate) struct ImplsQuery {
     #[serde(rename = "trait")]
-    trait_name: String,
-    workspace: String,
-    path_prefix: Option<String>,
+    pub(crate) trait_name: String,
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -622,11 +661,11 @@ struct ImplsResponse {
     total: usize,
 }
 
-async fn impls_of_trait(
-    State(state): State<SharedState>,
-    Query(params): Query<ImplsQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn impls_of_trait_impl(
+    state: &SharedState,
+    params: ImplsQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let symbols = reader::get_impls_of_trait(
             db,
             &params.workspace,
@@ -650,8 +689,14 @@ async fn impls_of_trait(
         };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn impls_of_trait(
+    State(state): State<SharedState>,
+    Query(params): Query<ImplsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(impls_of_trait_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -659,11 +704,11 @@ async fn impls_of_trait(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct InherentImplsQuery {
+pub(crate) struct InherentImplsQuery {
     #[serde(rename = "type")]
-    type_name: String,
-    workspace: String,
-    path_prefix: Option<String>,
+    pub(crate) type_name: String,
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -681,11 +726,11 @@ struct InherentImplsResponse {
     impls: Vec<InherentImplEntry>,
 }
 
-async fn inherent_impls_of_type(
-    State(state): State<SharedState>,
-    Query(params): Query<InherentImplsQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn inherent_impls_of_type_impl(
+    state: &SharedState,
+    params: InherentImplsQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let impl_syms = reader::get_inherent_impls_of_type(
             db,
             &params.workspace,
@@ -717,8 +762,14 @@ async fn inherent_impls_of_type(
         };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn inherent_impls_of_type(
+    State(state): State<SharedState>,
+    Query(params): Query<InherentImplsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(inherent_impls_of_type_impl(&state, params).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -726,9 +777,9 @@ async fn inherent_impls_of_type(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct ImplSummaryQuery {
-    workspace: String,
-    path_prefix: Option<String>,
+pub(crate) struct ImplSummaryQuery {
+    pub(crate) workspace: String,
+    pub(crate) path_prefix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -743,11 +794,11 @@ struct ImplSummaryResponse {
     traits: Vec<TraitImplSummaryEntry>,
 }
 
-async fn impl_summary(
-    State(state): State<SharedState>,
-    Query(params): Query<ImplSummaryQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn impl_summary_impl(
+    state: &SharedState,
+    params: ImplSummaryQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let rows = reader::get_impl_summary(db, &params.workspace, params.path_prefix.as_deref())?;
         let traits: Vec<TraitImplSummaryEntry> = rows
             .into_iter()
@@ -760,6 +811,12 @@ async fn impl_summary(
         let resp = ImplSummaryResponse { traits };
         Ok(serde_json::json!(resp))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn impl_summary(
+    State(state): State<SharedState>,
+    Query(params): Query<ImplSummaryQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(impl_summary_impl(&state, params).await?))
 }

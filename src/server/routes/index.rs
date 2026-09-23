@@ -29,11 +29,13 @@ pub fn router() -> DocRouter<SharedState> {
 /// `/index` is a request for the freshest possible index, not a poll, so
 /// blocking until it's this call's turn and then running is more useful
 /// than making the caller retry.
-async fn post_index(
-    State(state): State<SharedState>,
-    Json(req): Json<IndexRequest>,
-) -> Result<Json<IndexResult>, AppError> {
+pub(crate) async fn post_index_impl(state: &SharedState, req: IndexRequest) -> Result<IndexResult, AppError> {
     let _guard = state.index_locks.acquire(&req.workspace_id).await;
     let result = Indexer::run(&state.reader_pool, &state.writer, &req).await?;
+    Ok(result)
+}
+
+async fn post_index(State(state): State<SharedState>, Json(req): Json<IndexRequest>) -> Result<Json<IndexResult>, AppError> {
+    let result = post_index_impl(&state, req).await?;
     Ok(Json(result))
 }

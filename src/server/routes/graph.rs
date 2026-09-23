@@ -44,47 +44,53 @@ pub fn router() -> DocRouter<SharedState> {
 }
 
 #[derive(Deserialize)]
-struct WorkspaceQuery {
-    workspace: Option<String>,
+pub(crate) struct WorkspaceQuery {
+    pub(crate) workspace: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct CrateQuery {
+pub(crate) struct CrateQuery {
     #[serde(rename = "crate")]
-    crate_name: String,
-    workspace: Option<String>,
+    pub(crate) crate_name: String,
+    pub(crate) workspace: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct FileQuery {
-    file: String,
-    workspace: Option<String>,
+pub(crate) struct FileQuery {
+    pub(crate) file: String,
+    pub(crate) workspace: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct HotspotsQuery {
-    workspace: Option<String>,
-    limit: Option<u32>,
+pub(crate) struct HotspotsQuery {
+    pub(crate) workspace: Option<String>,
+    pub(crate) limit: Option<u32>,
+}
+
+pub(crate) async fn list_crates_impl(
+    state: &SharedState,
+    params: WorkspaceQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
+        let nodes = reader::list_crate_nodes(db, params.workspace.as_deref())?;
+        let edges = reader::list_crate_deps(db, params.workspace.as_deref())?;
+        Ok(serde_json::json!({ "nodes": nodes, "edges": edges }))
+    })
+    .await
 }
 
 async fn list_crates(
     State(state): State<SharedState>,
     Query(params): Query<WorkspaceQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
-        let nodes = reader::list_crate_nodes(db, params.workspace.as_deref())?;
-        let edges = reader::list_crate_deps(db, params.workspace.as_deref())?;
-        Ok(serde_json::json!({ "nodes": nodes, "edges": edges }))
-    })
-    .await?;
-    Ok(Json(value))
+    Ok(Json(list_crates_impl(&state, params).await?))
 }
 
-async fn files_in_crate(
-    State(state): State<SharedState>,
-    Query(params): Query<CrateQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn files_in_crate_impl(
+    state: &SharedState,
+    params: CrateQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let workspace = params.workspace.as_deref().unwrap_or("");
         let result = reader::list_file_edges(db, workspace, None)?;
         // Filter to edges that belong to the requested crate by crate name prefix
@@ -96,15 +102,21 @@ async fn files_in_crate(
             .collect();
         Ok(serde_json::json!(filtered))
     })
-    .await?;
-    Ok(Json(value))
+    .await
 }
 
-async fn impact_analysis(
+async fn files_in_crate(
     State(state): State<SharedState>,
-    Query(params): Query<FileQuery>,
+    Query(params): Query<CrateQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+    Ok(Json(files_in_crate_impl(&state, params).await?))
+}
+
+pub(crate) async fn impact_analysis_impl(
+    state: &SharedState,
+    params: FileQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let workspace = params.workspace.as_deref().unwrap_or("");
 
         // BFS over reverse file dependencies
@@ -127,19 +139,23 @@ async fn impact_analysis(
         let affected: Vec<String> = visited.into_iter().collect();
         Ok(serde_json::json!({ "file": params.file, "affected": affected }))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn impact_analysis(
+    State(state): State<SharedState>,
+    Query(params): Query<FileQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(impact_analysis_impl(&state, params).await?))
 }
 
 #[derive(Deserialize)]
-struct SymbolImpactQuery {
-    sym: String,
-    workspace: Option<String>,
-    depth: Option<u32>,
+pub(crate) struct SymbolImpactQuery {
+    pub(crate) sym: String,
+    pub(crate) workspace: Option<String>,
+    pub(crate) depth: Option<u32>,
 }
 
-/// `GET /graph/impact_symbol?sym=NAME&workspace=WS&depth=N`
-///
 /// Symbol-level impact analysis: BFS over `call_edges` outward from `sym`'s
 /// direct and transitive callers, up to `depth` hops (default
 /// [`DEFAULT_IMPACT_SYMBOL_DEPTH`], capped at [`MAX_IMPACT_SYMBOL_DEPTH`]).
@@ -155,11 +171,11 @@ struct SymbolImpactQuery {
 /// second, unrelated definition with the exact same name in the SAME
 /// workspace is indistinguishable from the intended one until SCIP can
 /// disambiguate by qualified path.
-async fn impact_analysis_symbol(
-    State(state): State<SharedState>,
-    Query(params): Query<SymbolImpactQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn impact_analysis_symbol_impl(
+    state: &SharedState,
+    params: SymbolImpactQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let workspace = params.workspace.as_deref();
         let depth = params
             .depth
@@ -214,37 +230,47 @@ async fn impact_analysis_symbol(
             "affected_files": affected_files,
         }))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn impact_analysis_symbol(
+    State(state): State<SharedState>,
+    Query(params): Query<SymbolImpactQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(impact_analysis_symbol_impl(&state, params).await?))
+}
+
+pub(crate) async fn hotspots_impl(
+    state: &SharedState,
+    params: HotspotsQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
+        let limit = params.limit.unwrap_or(20);
+        let result = reader::get_hotspots(db, params.workspace.as_deref(), limit)?;
+        Ok(serde_json::json!(result))
+    })
+    .await
 }
 
 async fn hotspots(
     State(state): State<SharedState>,
     Query(params): Query<HotspotsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
-        let limit = params.limit.unwrap_or(20);
-        let result = reader::get_hotspots(db, params.workspace.as_deref(), limit)?;
-        Ok(serde_json::json!(result))
-    })
-    .await?;
-    Ok(Json(value))
+    Ok(Json(hotspots_impl(&state, params).await?))
 }
 
 #[derive(Deserialize)]
-struct ResolveQuery {
-    sym: String,
-    workspace: String,
+pub(crate) struct ResolveQuery {
+    pub(crate) sym: String,
+    pub(crate) workspace: String,
 }
 
-/// `GET /graph/resolve?sym=ExchangeError&workspace=nemo`
-///
 /// Returns all symbols matching `sym` along with the crate that owns each one.
-async fn resolve_symbol(
-    State(state): State<SharedState>,
-    Query(params): Query<ResolveQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let value = with_db(&state, move |db| {
+pub(crate) async fn resolve_symbol_impl(
+    state: &SharedState,
+    params: ResolveQuery,
+) -> Result<serde_json::Value, AppError> {
+    with_db(state, move |db| {
         let hits = reader::resolve_symbol_to_crate(db, &params.workspace, &params.sym)?;
         let results: Vec<serde_json::Value> = hits
             .into_iter()
@@ -257,8 +283,14 @@ async fn resolve_symbol(
             .collect();
         Ok(serde_json::json!({ "sym": params.sym, "results": results }))
     })
-    .await?;
-    Ok(Json(value))
+    .await
+}
+
+async fn resolve_symbol(
+    State(state): State<SharedState>,
+    Query(params): Query<ResolveQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(resolve_symbol_impl(&state, params).await?))
 }
 
 #[cfg(test)]
