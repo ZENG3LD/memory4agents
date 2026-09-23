@@ -1299,6 +1299,6 @@ pub fn get_impl_summary(
         .collect();
 
     // Sort by implementor_count desc.
-    rows.sort_by(|a, b| b.implementor_count.cmp(&a.implementor_count));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.implementor_count));
     Ok(rows)
 }

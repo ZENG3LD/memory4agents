@@ -409,8 +409,8 @@ async fn parallel_systems(
         parent[x]
     }
 
-    for i in 0..n {
-        for &j in &adj[i] {
+    for (i, neighbors) in adj.iter().enumerate() {
+        for &j in neighbors {
             let ri = find(&mut parent, i);
             let rj = find(&mut parent, j);
             if ri != rj {
@@ -468,7 +468,7 @@ async fn parallel_systems(
     }
 
     // Re-assign sequential IDs and sort by size desc.
-    components.sort_by(|a, b| b.size.cmp(&a.size));
+    components.sort_by_key(|c| std::cmp::Reverse(c.size));
     for (i, comp) in components.iter_mut().enumerate() {
         comp.id = i;
     }
@@ -1365,8 +1365,8 @@ async fn find_twins(
     }
 
     // Sort all by type_use_count desc
-    exact_shape.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count));
-    loose_shape.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count));
+    exact_shape.sort_by_key(|t| std::cmp::Reverse(t.type_use_count));
+    loose_shape.sort_by_key(|t| std::cmp::Reverse(t.type_use_count));
     shared_token.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
     synonym_token.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
     similar_size.sort_by(|a, b| b.type_use_count.cmp(&a.type_use_count).then(a.name.cmp(&b.name)));
@@ -1550,7 +1550,7 @@ async fn workspace_summary(
         .into_iter()
         .map(|(path, dead_count)| WsDeadSubsystem { path, dead_count })
         .collect();
-    by_subsystem.sort_by(|a, b| b.dead_count.cmp(&a.dead_count));
+    by_subsystem.sort_by_key(|s| std::cmp::Reverse(s.dead_count));
     by_subsystem.truncate(10);
 
     // Hotspots top 10
@@ -1698,7 +1698,7 @@ fn summarise_dup_rows(
     let total_locations: usize = groups.iter().map(|(_, _, names)| names.len()).sum();
     let group_count = groups.len();
 
-    groups.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
+    groups.sort_by_key(|g| std::cmp::Reverse(g.2.len()));
 
     let biggest: Vec<WsBiggestDupGroup> = groups
         .into_iter()
@@ -1801,7 +1801,7 @@ async fn cleanup_plan(
     }
 
     // Sort exact dups by savings desc
-    actions.sort_by(|a, b| b.estimated_savings_lines.cmp(&a.estimated_savings_lines));
+    actions.sort_by_key(|a| std::cmp::Reverse(a.estimated_savings_lines));
 
     // --- 2. Dead subsystems ---
     let dead_syms = reader::get_dead_types(db, workspace, path_prefix, None)?;
@@ -1827,7 +1827,7 @@ async fn cleanup_plan(
             }
         })
         .collect();
-    dead_subsys_actions.sort_by(|a, b| b.estimated_savings_lines.cmp(&a.estimated_savings_lines));
+    dead_subsys_actions.sort_by_key(|a| std::cmp::Reverse(a.estimated_savings_lines));
 
     // --- 3. Synonym role consolidation ---
     let struct_syms =
@@ -1866,7 +1866,7 @@ async fn cleanup_plan(
             }
         })
         .collect();
-    synonym_actions.sort_by(|a, b| b.estimated_savings_lines.cmp(&a.estimated_savings_lines));
+    synonym_actions.sort_by_key(|a| std::cmp::Reverse(a.estimated_savings_lines));
 
     // Merge all in priority order
     let mut all_actions: Vec<CleanupAction> = Vec::new();

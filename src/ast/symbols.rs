@@ -319,37 +319,34 @@ fn collect_body_uses_recursive(
     symbols: &[Symbol],
     out: &mut Vec<PendingTypeUse>,
 ) {
-    match node.kind() {
-        "function_item" => {
-            // Find block child
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if child.kind() == "block" {
-                    let body_text = child.utf8_text(src).unwrap_or("");
-                    let norm = normalize(body_text);
-                    // Find best matching symbol by start line
-                    let fn_line = node.start_position().row as u32 + 1;
-                    if let Some(sym) = symbols.iter().find(|s| s.line == fn_line) {
-                        let pending = extract_body_uses(&norm, sym);
-                        out.extend(pending);
-                    }
+    if node.kind() == "function_item" {
+        // Find block child
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "block" {
+                let body_text = child.utf8_text(src).unwrap_or("");
+                let norm = normalize(body_text);
+                // Find best matching symbol by start line
+                let fn_line = node.start_position().row as u32 + 1;
+                if let Some(sym) = symbols.iter().find(|s| s.line == fn_line) {
+                    let pending = extract_body_uses(&norm, sym);
+                    out.extend(pending);
+                }
+                break;
+            }
+        }
+        // Still recurse for nested fns
+        let mut cursor2 = node.walk();
+        if cursor2.goto_first_child() {
+            loop {
+                collect_body_uses_recursive(cursor2.node(), src, symbols, out);
+                if !cursor2.goto_next_sibling() {
                     break;
                 }
             }
-            // Still recurse for nested fns
-            let mut cursor2 = node.walk();
-            if cursor2.goto_first_child() {
-                loop {
-                    collect_body_uses_recursive(cursor2.node(), src, symbols, out);
-                    if !cursor2.goto_next_sibling() {
-                        break;
-                    }
-                }
-                cursor2.goto_parent();
-            }
-            return;
+            cursor2.goto_parent();
         }
-        _ => {}
+        return;
     }
 
     // Default: recurse into children
