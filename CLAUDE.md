@@ -35,28 +35,27 @@ not just an AST index. The rename plan is
 - **New agents need IDE restart** to register.
 - **DB access from a route handler**: always
   `crate::server::state::with_db(&state, move |conn| { ... })` — runs the
-  closure in `spawn_blocking` and takes/releases the `state.db` mutex
-  entirely inside it. Never `state.db.lock()` directly inside an `async fn`
-  handler (that locks/queries on a tokio worker thread and can starve other
-  routes). `/health` is the one exception: it never touches `state.db` at
-  all, see below. This rule describes the storage every route still uses
-  today (`crate::db`) — see "Storage engine" below for what's replacing it.
+  closure in `spawn_blocking` over one connection checked out from
+  `state.reader_pool` for the closure's duration only. Never touch
+  `state.writer` directly from a route handler (that's the single writer —
+  see "Storage engine" below). `/health` is the one exception: it never
+  touches the database at all, see below.
 
-## Storage engine (mid-migration)
+## Storage engine
 
-Two storage layers currently coexist in this crate, deliberately, across a
-sequence of gated pieces (plan phase 0):
+`AppState`, every route (including every heavy analytics route in
+`server::routes::usage`), and the async `Indexer` are wired onto
+`crate::storage` (plan pieces 0.3-0.6, all landed). The original mutex-per-
+connection storage (`crate::db::schema::init_schema` + a raw
+`Arc<Mutex<Connection>>` in `AppState`) is retired — `crate::db` now holds
+only `reader`/`writer`, pure query/mutation functions over a
+`&Connection`/`&mut Connection` regardless of how that connection was
+obtained, called from both `with_db` closures (reader pool) and `WriteOp`
+closures (the batch writer).
 
-- **`crate::db`** — the original storage: one `Arc<Mutex<rusqlite::Connection>>`
-  shared by every route AND the indexer, taken via `spawn_blocking` at every
-  call site. This is what every route handler and the indexer actually run
-  against today. Its known defect: one heavy analytics route holds the
-  global mutex for the query's whole duration, blocking every other route
-  (including `/index`) for as long as it runs.
-- **`crate::storage`** — the replacement engine (pieces 0.3-0.4 landed;
-  0.5-0.9 pending), modeled on `servertoolkit-db` the way
-  `mail4agent-store-sqlite` modeled the same source — own types in this
-  crate, no `servertoolkit` dependency:
+`crate::storage`, modeled on `servertoolkit-db` the way
+`mail4agent-store-sqlite` modeled the same source — own types in this
+crate, no `servertoolkit` dependency:
   - `storage::Db` — the sole writer connection (WAL + foreign_keys=ON),
     never exposed to a route handler; only `storage::BatchWriter` and the
     migration bootstrap touch it.
@@ -79,13 +78,22 @@ sequence of gated pieces (plan phase 0):
     live 2.76 GB database adopt the new ledger without a "duplicate column"
     failure on first boot under the new code.
 
-**Nothing is wired onto `storage::*` yet** — `AppState`, every route, and
-the indexer still run on `crate::db` exactly as before. That rewiring
-(`AppState` swapping to `{writer, reader_pool}`, `with_db`'s body changing
-from mutex-lock to `reader_pool.read(...)`, the indexer's write path moving
-to per-file `WriteOp`s) is plan piece 0.5 onward — a separate, larger change
-gated on its own. Until it lands, `crate::storage` is covered entirely by
-its own unit tests (`cargo test -p memory4agent --release --lib storage::`).
+`AppState` is `{ writer: BatchWriter, reader_pool: DbPool, data_dir, stats_cache }`.
+Boot sequence in `bin/server.rs`: `Db::open` (writer connection) →
+`seed_legacy_versions_if_needed` → `MigrationRunner::run(legacy_schema_migrations())`
+on that same connection → `DbPool::open_with_size` (reader pool) →
+`BatchWriter::new` (writer). `index::indexer::Indexer::run(reader_pool,
+writer, req)` is `async`: reads (mtime filtering) go through `reader_pool`,
+writes are one `WriteOp` per file/phase enqueued on `writer`, with
+`barrier_async()` between phases that must see an earlier phase's writes
+committed (stale-file removal, callsite/type-use count recompute, the final
+`indexed_at` stamp). A `POST /index` caller sees committed data the instant
+the call returns — the last thing `Indexer::run` does is `barrier_async()`.
+Covered by `cargo test -p memory4agent --release --lib storage::`,
+`--lib index::indexer::`, and `--lib server::` (the last includes a test
+that a slow read on the pool never blocks a concurrent read, a `/health`
+answer, or a write landing on the writer — the fix for the retired
+global-mutex defect).
 
 ## Starting the server
 
@@ -100,8 +108,9 @@ cd dig2memory && MEMORY4AGENT_DATA_DIR="./data" ./target/release/memory4agent-se
 
 Env vars: `MEMORY4AGENT_PORT` (default 18200), `MEMORY4AGENT_DATA_DIR`
 (default `./data`; the live service sets this to `./data`),
-`MEMORY4AGENT_READER_POOL_SIZE` (default 8, read but not yet wired — see
-"Storage engine" above). The CLI's `--db` flag overrides both env vars; if
+`MEMORY4AGENT_READER_POOL_SIZE` (default 8 — number of concurrent
+`storage::DbPool` connections, see "Storage engine" above). The CLI's
+`--db` flag overrides both env vars; if
 unset it checks `MEMORY4AGENT_DATA_DIR` then falls back to the legacy
 `DIG2MEMORY_DATA_DIR` for scripts/agent configs written before the rename.
 

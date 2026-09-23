@@ -20,15 +20,6 @@ async fn post_index(
     State(state): State<SharedState>,
     Json(req): Json<IndexRequest>,
 ) -> Result<Json<IndexResult>, AppError> {
-    // Clone the Arc so the closure owns it.
-    let db = state.db.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        let mut indexer = Indexer::new()?;
-        indexer.run(&db, &req)
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("task join error: {}", e)))??;
-
+    let result = Indexer::run(&state.reader_pool, &state.writer, &req).await?;
     Ok(Json(result))
 }

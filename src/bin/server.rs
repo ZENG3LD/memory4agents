@@ -1,12 +1,13 @@
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
-use memory4agent::db::schema::init_schema;
 use memory4agent::server::config::Config;
 use memory4agent::server::registration;
 use memory4agent::server::state::{AppState, SharedState};
 use memory4agent::server::stats::{spawn_stats_refresher, StatsCache};
 use memory4agent::server::routes;
+use memory4agent::storage::migrations::{legacy_schema_migrations, seed_legacy_versions_if_needed};
+use memory4agent::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool, MigrationRunner};
 use nemo_service::register;
 
 #[tokio::main]
@@ -21,11 +22,32 @@ async fn main() {
     std::fs::create_dir_all(&config.data_dir).expect("failed to create data dir");
 
     let db_path = format!("{}/index.db", config.data_dir);
-    let conn = rusqlite::Connection::open(&db_path).expect("failed to open SQLite");
-    init_schema(&conn).expect("failed to init schema");
+
+    // The writer's own connection. Never handed to a route handler — only
+    // `BatchWriter`'s worker thread (started below) and this boot sequence
+    // touch it directly.
+    let db = Db::open(&DbConfig::new(&db_path)).expect("failed to open writer db");
+
+    // One-time backfill for a database written before the versioned-migration
+    // rewrite (see `storage::migrations::seed_legacy_versions_if_needed`).
+    // No-op on a fresh database or one already carrying `schema_migrations`.
+    let seed_db = db.clone();
+    tokio::task::spawn_blocking(move || seed_db.write_blocking(|conn| seed_legacy_versions_if_needed(conn)))
+        .await
+        .expect("legacy schema backfill task panicked")
+        .expect("legacy schema backfill failed");
+
+    db.run_migrations(MigrationRunner::new(legacy_schema_migrations()))
+        .await
+        .expect("failed to run migrations");
+
+    let reader_pool = DbPool::open_with_size(&DbConfig::new(&db_path), config.reader_pool_size)
+        .expect("failed to open reader pool");
+    let writer = BatchWriter::new(db, BatchConfig::default());
 
     let state: SharedState = Arc::new(AppState {
-        db: Arc::new(Mutex::new(conn)),
+        writer,
+        reader_pool,
         data_dir: config.data_dir,
         stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
     });

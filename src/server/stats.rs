@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::db::reader;
 use crate::server::state::{AppState, SharedState};
+use crate::CoreError;
 
 /// How often the background task refreshes the cached DB stats.
 ///
@@ -51,21 +52,24 @@ impl StatsCache {
 /// Runs one stats refresh against the database and stores the result in
 /// `state.stats_cache`.
 ///
-/// The query itself runs inside `spawn_blocking` so it never blocks a tokio
-/// worker thread, and the DB mutex is only ever held inside that blocking
-/// task — never across an `.await`.
+/// The query itself runs inside `spawn_blocking` over one checked-out
+/// reader-pool connection, so it never blocks a tokio worker thread and
+/// never contends with the single writer or with any other route.
 async fn refresh_once(state: &Arc<AppState>) {
-    let db = state.db.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<(u32, u32, u32), String> {
-        let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
-        let workspace_count = reader::list_workspaces(&conn)
-            .map_err(|e| e.to_string())?
-            .len() as u32;
-        let symbol_count = reader::count_symbols(&conn, None).map_err(|e| e.to_string())?;
-        let file_count = reader::count_files(&conn, None).map_err(|e| e.to_string())?;
-        Ok((workspace_count, symbol_count, file_count))
-    })
-    .await;
+    let result = match state.reader_pool.acquire().await {
+        Ok(guard) => {
+            tokio::task::spawn_blocking(move || -> Result<(u32, u32, u32), CoreError> {
+                let workspace_count = reader::list_workspaces(&guard)?.len() as u32;
+                let symbol_count = reader::count_symbols(&guard, None)?;
+                let file_count = reader::count_files(&guard, None)?;
+                Ok((workspace_count, symbol_count, file_count))
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|inner| inner.map_err(|e| e.to_string()))
+        }
+        Err(e) => Err(format!("reader pool: {e}")),
+    };
 
     let mut cache = state
         .stats_cache
@@ -73,20 +77,15 @@ async fn refresh_once(state: &Arc<AppState>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     match result {
-        Ok(Ok((workspace_count, symbol_count, file_count))) => {
+        Ok((workspace_count, symbol_count, file_count)) => {
             cache.ok = true;
             cache.workspace_count = workspace_count;
             cache.symbol_count = symbol_count;
             cache.file_count = file_count;
             cache.updated_at = Some(Instant::now());
         }
-        Ok(Err(msg)) => {
-            tracing::warn!("[dig2memory] stats refresh query failed: {msg}");
-            cache.ok = false;
-            cache.updated_at = Some(Instant::now());
-        }
-        Err(join_err) => {
-            tracing::warn!("[dig2memory] stats refresh task panicked: {join_err}");
+        Err(msg) => {
+            tracing::warn!("[memory4agent] stats refresh failed: {msg}");
             cache.ok = false;
             cache.updated_at = Some(Instant::now());
         }

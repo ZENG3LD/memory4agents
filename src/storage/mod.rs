@@ -3,14 +3,14 @@
 //! way `mail4agent-store-sqlite` modeled the same source — own types in
 //! this crate, no `servertoolkit` dependency.
 //!
-//! This module is additive: `crate::db` (the mutex-per-connection storage
-//! every existing route/indexer still uses) keeps compiling and running
-//! unchanged until `AppState` and the indexer are rewired onto this module
-//! (plan piece 0.5). Until then nothing in `bin/server.rs` constructs a
-//! [`Db`]/[`DbPool`]/[`batch::BatchWriter`] — this module exists standalone,
-//! covered by its own tests, so 0.5 rewires call sites onto an
-//! already-proven storage engine instead of building and wiring it in the
-//! same step.
+//! `AppState`, every route, and the async `Indexer` are wired onto this
+//! module (plan pieces 0.5-0.6): every HTTP/MCP read runs against
+//! [`DbPool`], every write is enqueued on [`batch::BatchWriter`]. The
+//! original mutex-per-connection storage this replaced (`crate::db::schema`
+//! and a raw `Arc<Mutex<Connection>>` in `AppState`) has been retired —
+//! `crate::db` now holds only `reader`/`writer`, pure functions over a
+//! `&Connection`/`&mut Connection` regardless of how that connection was
+//! obtained.
 
 pub mod batch;
 pub mod config;

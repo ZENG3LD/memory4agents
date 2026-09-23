@@ -21,6 +21,9 @@ pub enum CoreError {
     #[error("workspace not found: {id}")]
     WorkspaceNotFound { id: String },
 
-    #[error("db mutex poisoned")]
-    LockPoisoned,
+    #[error("storage error: {0}")]
+    Storage(#[from] crate::storage::DbError),
+
+    #[error("background task join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
 }

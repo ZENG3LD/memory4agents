@@ -10,8 +10,9 @@ use crate::server::state::SharedState;
 use crate::HealthStatus;
 
 /// Bound on how long `/ready` will wait for a trivial DB round-trip before
-/// answering "not ready". Keeps the endpoint responsive even while a long
-/// operation (e.g. `/index`) holds the DB lock.
+/// answering "not ready". `/index`'s writes go through the independent
+/// `BatchWriter`, never the reader pool, so this only ever waits on the
+/// reader pool's own N connection slots.
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn router() -> DocRouter<SharedState> {
@@ -29,7 +30,7 @@ pub fn router() -> DocRouter<SharedState> {
         .get(
             "/ready",
             get_ready,
-            RouteDoc::new("Readiness probe — bounded SELECT 1; 503 if the DB is locked/unreachable").public(),
+            RouteDoc::new("Readiness probe — bounded SELECT 1; 503 if the reader pool is exhausted/unreachable").public(),
         )
 }
 
@@ -61,27 +62,17 @@ struct ReadyStatus {
 
 /// Readiness probe: can the store actually answer a query right now?
 ///
-/// Runs a trivial `SELECT 1` in `spawn_blocking` and bounds the wait with
-/// [`READY_TIMEOUT`]. If the DB mutex is currently held by a long operation
-/// (e.g. a re-index), this returns `503` promptly instead of hanging — the
-/// blocking task itself is left to finish in the background.
+/// Checks out one reader-pool connection and runs a trivial `SELECT 1` in
+/// `spawn_blocking`, bounding the whole wait with [`READY_TIMEOUT`]. Unlike
+/// the retired mutex-backed implementation, this never waits on a heavy
+/// analytics route or `/index` — it only ever waits for one of the reader
+/// pool's own N slots.
 async fn get_ready(State(state): State<SharedState>) -> impl IntoResponse {
-    let db = state.db.clone();
-    let query = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
-        conn.query_row("SELECT 1", [], |_row| Ok(()))
-            .map_err(|e| e.to_string())
-    });
-
-    let (status, body) = match tokio::time::timeout(READY_TIMEOUT, query).await {
-        Ok(Ok(Ok(()))) => (StatusCode::OK, ReadyStatus { ready: true, error: None }),
-        Ok(Ok(Err(msg))) => (
+    let (status, body) = match tokio::time::timeout(READY_TIMEOUT, ready_probe(&state)).await {
+        Ok(Ok(())) => (StatusCode::OK, ReadyStatus { ready: true, error: None }),
+        Ok(Err(msg)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             ReadyStatus { ready: false, error: Some(msg) },
-        ),
-        Ok(Err(join_err)) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            ReadyStatus { ready: false, error: Some(join_err.to_string()) },
         ),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -92,44 +83,64 @@ async fn get_ready(State(state): State<SharedState>) -> impl IntoResponse {
     (status, Json(body))
 }
 
+async fn ready_probe(state: &SharedState) -> Result<(), String> {
+    let guard = state.reader_pool.acquire().await.map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || {
+        guard
+            .query_row("SELECT 1", [], |_row| Ok(()))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::server::state::{with_db, AppError, AppState};
     use crate::server::stats::StatsCache;
-    use std::sync::{Arc, Mutex, RwLock};
+    use crate::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool};
+    use std::sync::{Arc, RwLock};
     use std::time::Instant;
 
     fn test_state() -> SharedState {
-        let conn = rusqlite::Connection::open_in_memory()
-            .expect("in-memory sqlite connection must open");
+        let db = Db::open(&DbConfig::in_memory()).expect("in-memory writer db opens");
+        let reader_pool = DbPool::open_with_size(&DbConfig::in_memory(), 8).expect("in-memory reader pool opens");
+        let writer = BatchWriter::new(db, BatchConfig::default());
         Arc::new(AppState {
-            db: Arc::new(Mutex::new(conn)),
+            writer,
+            reader_pool,
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
         })
     }
 
-    /// `/health` must answer instantly even while a long DB read holds the
-    /// same connection mutex the old implementation's `count_symbols` call
-    /// used to lock — reproducing the 45s watchdog-timeout failure mode.
+    /// `/health` must answer instantly even while a long read holds one of
+    /// the reader pool's own connections — reproducing (and proving fixed)
+    /// the retired global-mutex implementation's 45s watchdog-timeout
+    /// failure mode.
     #[tokio::test]
-    async fn health_answers_while_db_lock_is_held() {
+    async fn health_answers_while_a_reader_pool_connection_is_held() {
         let state = test_state();
 
         // Simulate a long-running DB read (what count_symbols used to do
-        // over the 2.7GB on-disk index) holding the same mutex.
+        // over the 2.7GB on-disk index) holding one pool connection.
         let (lock_acquired_tx, lock_acquired_rx) = tokio::sync::oneshot::channel();
-        let db = state.db.clone();
-        let hold_task = tokio::task::spawn_blocking(move || {
-            let _conn = db.lock().expect("db lock");
-            let _ = lock_acquired_tx.send(());
-            std::thread::sleep(Duration::from_millis(1500));
+        let pool = state.reader_pool.clone();
+        let hold_task = tokio::spawn(async move {
+            let guard = pool.acquire().await.expect("acquire reader pool connection");
+            tokio::task::spawn_blocking(move || {
+                let _ = lock_acquired_tx.send(());
+                std::thread::sleep(Duration::from_millis(1500));
+                drop(guard);
+            })
+            .await
+            .expect("hold task must not panic");
         });
 
         lock_acquired_rx
             .await
-            .expect("hold task must signal lock acquisition before we probe /health");
+            .expect("hold task must signal connection acquisition before we probe /health");
 
         let started = Instant::now();
         let Json(status) = get_health(State(state.clone())).await;
@@ -138,7 +149,7 @@ mod tests {
         assert!(status.ok, "cache-only /health should report ok before any refresh failure");
         assert!(
             elapsed < Duration::from_millis(300),
-            "/health took {elapsed:?} while the DB lock was held — it must never wait on the DB"
+            "/health took {elapsed:?} while a reader pool connection was held — it must never wait on the DB"
         );
 
         hold_task.await.expect("hold task must not panic");
@@ -147,7 +158,7 @@ mod tests {
     /// `/health` must stay responsive even when many concurrent "slow
     /// handler" calls — more than the runtime has worker threads — are all
     /// going through `with_db`, the way `/ast`, `/graph` and `/usage`
-    /// routes do since their conversion off direct `state.db.lock()`.
+    /// routes do (each checking out its own reader-pool connection).
     ///
     /// The runtime here is pinned to 2 worker threads; 8 concurrent slow
     /// `with_db` calls (each blocking a spawn_blocking thread, not a
@@ -169,8 +180,8 @@ mod tests {
             }));
         }
 
-        // Let the slow tasks actually start contending for the DB mutex
-        // before probing /health.
+        // Let the slow tasks actually start contending for reader-pool
+        // slots before probing /health.
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let started = Instant::now();

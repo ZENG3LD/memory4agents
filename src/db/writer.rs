@@ -1,11 +1,10 @@
-use crate::error::CoreError;
 use crate::search::trigram::trigrams;
 use crate::types::{CallEdge, CrateNode, DepEdge, FileEdge, FileRecord, Symbol, TypeUseEdge, Workspace};
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
 
 /// Insert or update a workspace record.
-pub fn upsert_workspace(conn: &Connection, workspace: &Workspace) -> Result<(), CoreError> {
+pub fn upsert_workspace(conn: &Connection, workspace: &Workspace) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO workspaces (id, root_path, name, indexed_at)
          VALUES (?1, ?2, ?3, ?4)
@@ -24,7 +23,7 @@ pub fn upsert_workspace(conn: &Connection, workspace: &Workspace) -> Result<(), 
 }
 
 /// Insert or update a file record.
-pub fn upsert_file_record(conn: &Connection, rec: &FileRecord) -> Result<(), CoreError> {
+pub fn upsert_file_record(conn: &Connection, rec: &FileRecord) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO file_records (workspace_id, file_path, mtime, size, symbol_count)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -48,7 +47,7 @@ pub fn delete_file_symbols(
     conn: &Connection,
     workspace_id: &str,
     file_path: &str,
-) -> Result<(), CoreError> {
+) -> rusqlite::Result<()> {
     // Collect symbol ids before deleting, so we can remove type_use_edges.
     let ids: Vec<i64> = {
         let mut stmt = conn.prepare(
@@ -81,7 +80,7 @@ pub fn delete_file_symbols(
 }
 
 /// Insert a symbol and return its new rowid.
-pub fn insert_symbol(conn: &Connection, sym: &Symbol) -> Result<i64, CoreError> {
+pub fn insert_symbol(conn: &Connection, sym: &Symbol) -> rusqlite::Result<i64> {
     conn.execute(
         "INSERT INTO symbols (workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
@@ -109,7 +108,7 @@ pub fn insert_symbol(conn: &Connection, sym: &Symbol) -> Result<i64, CoreError> 
 }
 
 /// Insert a type-use edge (ignore on duplicate primary key).
-pub fn insert_type_use_edge(conn: &Connection, edge: &TypeUseEdge) -> Result<(), CoreError> {
+pub fn insert_type_use_edge(conn: &Connection, edge: &TypeUseEdge) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO type_use_edges (workspace_id, from_symbol_id, to_symbol_id, use_kind)
          VALUES (?1, ?2, ?3, ?4)",
@@ -124,7 +123,7 @@ pub fn insert_type_use_edge(conn: &Connection, edge: &TypeUseEdge) -> Result<(),
 }
 
 /// Update type_use_count for all symbols in a workspace from type_use_edges (in-degree).
-pub fn update_type_use_counts(conn: &Connection, workspace_id: &str) -> Result<(), CoreError> {
+pub fn update_type_use_counts(conn: &Connection, workspace_id: &str) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE symbols
          SET type_use_count = (
@@ -140,7 +139,7 @@ pub fn update_type_use_counts(conn: &Connection, workspace_id: &str) -> Result<(
 }
 
 /// Update callsite_count for all symbols in a workspace from call_edges.
-pub fn update_callsite_counts(conn: &Connection, workspace_id: &str) -> Result<(), CoreError> {
+pub fn update_callsite_counts(conn: &Connection, workspace_id: &str) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE symbols
          SET callsite_count = (
@@ -159,7 +158,7 @@ pub fn insert_symbol_trigrams(
     conn: &Connection,
     symbol_id: i64,
     name: &str,
-) -> Result<(), CoreError> {
+) -> rusqlite::Result<()> {
     for tgram in trigrams(name) {
         conn.execute(
             "INSERT OR IGNORE INTO symbol_trigrams (symbol_id, trigram) VALUES (?1, ?2)",
@@ -170,7 +169,7 @@ pub fn insert_symbol_trigrams(
 }
 
 /// Insert a call edge.
-pub fn insert_call_edge(conn: &Connection, edge: &CallEdge) -> Result<(), CoreError> {
+pub fn insert_call_edge(conn: &Connection, edge: &CallEdge) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO call_edges (workspace_id, caller_file, caller_symbol_id, callee_name, line)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -186,7 +185,7 @@ pub fn insert_call_edge(conn: &Connection, edge: &CallEdge) -> Result<(), CoreEr
 }
 
 /// Insert or update a file edge.
-pub fn upsert_file_edge(conn: &Connection, edge: &FileEdge) -> Result<(), CoreError> {
+pub fn upsert_file_edge(conn: &Connection, edge: &FileEdge) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO file_edges (workspace_id, from_file, to_file, kind)
          VALUES (?1, ?2, ?3, ?4)
@@ -202,7 +201,7 @@ pub fn upsert_file_edge(conn: &Connection, edge: &FileEdge) -> Result<(), CoreEr
 }
 
 /// Insert or update a crate node.
-pub fn upsert_crate_node(conn: &Connection, node: &CrateNode) -> Result<(), CoreError> {
+pub fn upsert_crate_node(conn: &Connection, node: &CrateNode) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO crate_nodes (workspace_id, name, version, manifest_path, source_dir, is_workspace_member)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -224,7 +223,7 @@ pub fn upsert_crate_node(conn: &Connection, node: &CrateNode) -> Result<(), Core
 }
 
 /// Insert or update a crate dependency edge.
-pub fn upsert_crate_dep_edge(conn: &Connection, edge: &DepEdge) -> Result<(), CoreError> {
+pub fn upsert_crate_dep_edge(conn: &Connection, edge: &DepEdge) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO crate_dep_edges (workspace_id, from_crate, to_crate, is_path_dep, dep_path)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -247,7 +246,7 @@ pub fn delete_stale_files(
     conn: &Connection,
     workspace_id: &str,
     current_files: &HashSet<String>,
-) -> Result<(), CoreError> {
+) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare(
         "SELECT file_path FROM file_records WHERE workspace_id = ?1",
     )?;
