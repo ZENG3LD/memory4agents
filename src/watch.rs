@@ -102,6 +102,16 @@ pub fn spawn_watcher(state: SharedState, workspace_id: String, root_path: String
 
     let coalesce: Arc<StdMutex<CoalesceState>> = Arc::new(StdMutex::new(CoalesceState::default()));
 
+    // `on_trigger` below runs on the plain `m4a-watch-debounce` OS thread
+    // (see `watch_and_debounce`), never on a Tokio worker thread. Bare
+    // `tokio::spawn` panics there ("there is no reactor running") because it
+    // relies on a thread-local pointing at the current runtime, which only
+    // Tokio's own worker threads set. `spawn_watcher` itself IS called from
+    // inside the running Tokio runtime (`bin/server.rs`'s `#[tokio::main]`),
+    // so capturing a `Handle` here and calling `Handle::spawn` from the
+    // plain thread instead works regardless of which thread calls it.
+    let runtime_handle = tokio::runtime::Handle::current();
+
     let watcher = watch_and_debounce(&root, debounce, move |changed_paths: HashSet<PathBuf>| {
         let should_spawn_driver = {
             let mut cs = coalesce.lock().unwrap_or_else(|p| p.into_inner());
@@ -118,7 +128,7 @@ pub fn spawn_watcher(state: SharedState, workspace_id: String, root_path: String
             let workspace_id = workspace_id.clone();
             let root_path = root_path.clone();
             let coalesce = coalesce.clone();
-            tokio::spawn(run_reindex_driver(state, workspace_id, root_path, coalesce));
+            runtime_handle.spawn(run_reindex_driver(state, workspace_id, root_path, coalesce));
         }
     });
 
@@ -176,13 +186,92 @@ async fn run_reindex_driver(
     }
 }
 
+/// `root`'s git scope, resolved once when the watcher starts (not per
+/// event) and matching the scope [`crate::index::indexer::collect_source_files`]
+/// applies to a full workspace walk: when `root` is not a git repository,
+/// every path counts (the old behaviour, mirroring that function's own
+/// `WalkDir` fallback); when it is, an event counts only if its path sits
+/// inside one of the submodule directories declared in `root`'s
+/// `.gitmodules` (nemo's whole workspace is one gitlink-of-subgits — a
+/// `.gitmodules` lookup is enough to place any given event, no per-event
+/// `git` subprocess needed), or — the one case worth an actual `git`
+/// subprocess call, since a root-level filesystem event is rare — the path
+/// is itself a tracked root-level file (`CLAUDE.md`, `Cargo.toml`, …).
+struct GitScope {
+    is_git_repo: bool,
+    submodule_paths: Vec<String>,
+}
+
+impl GitScope {
+    fn load(root: &Path) -> Self {
+        let is_git_repo = crate::index::indexer::is_git_repo(root);
+        let submodule_paths = if is_git_repo { read_gitmodule_paths(root) } else { Vec::new() };
+        Self { is_git_repo, submodule_paths }
+    }
+
+    /// True if `abs_path` (a raw filesystem-event path, already known to
+    /// have survived [`is_path_excluded`]) is in scope for `root`.
+    fn contains(&self, root: &Path, abs_path: &Path) -> bool {
+        if !self.is_git_repo {
+            return true;
+        }
+        let rel = crate::index::indexer::to_relative(root, abs_path);
+        let in_a_submodule = self
+            .submodule_paths
+            .iter()
+            .any(|sp| rel == *sp || rel.starts_with(&format!("{sp}/")));
+        if in_a_submodule {
+            return true;
+        }
+        // No directory component at all -> a root-level path; anything
+        // deeper that isn't inside a known submodule is out of scope
+        // without a per-event `git` call (e.g. a nested non-submodule repo
+        // or a scratch directory — exactly what the git-scope rule exists
+        // to exclude).
+        !rel.contains('/') && is_tracked_root_level_file(root, &rel)
+    }
+}
+
+/// Parses `root/.gitmodules` into its declared submodule `path = …`
+/// values (forward-slash normalised). Returns an empty list if the file
+/// doesn't exist or has no `path` entries — never a hard error, since a
+/// missing `.gitmodules` is a legitimate state (a git repo with no
+/// submodules at all).
+fn read_gitmodule_paths(root: &Path) -> Vec<String> {
+    let content = match std::fs::read_to_string(root.join(".gitmodules")) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "path").then(|| value.trim().replace('\\', "/"))
+        })
+        .collect()
+}
+
+/// `git -C root ls-files --error-unmatch -- rel` — true only if git
+/// currently tracks `rel` (a root-level path, no directory component).
+fn is_tracked_root_level_file(root: &Path, rel: &str) -> bool {
+    crate::proc::hidden("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(rel)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Core debounce mechanism, decoupled from what gets triggered so it can be
 /// tested on its own (see this module's tests) without touching
 /// `Indexer`/the database. Watches `root` recursively; every event path
-/// that survives [`is_path_excluded`] joins the current batch and resets
-/// the debounce window. `on_trigger` fires exactly once per coalesced
-/// batch, receiving the set of surviving paths, after `debounce` has
-/// elapsed with no further surviving events.
+/// that survives [`is_path_excluded`] AND the git scope described by
+/// [`GitScope`] joins the current batch and resets the debounce window.
+/// `on_trigger` fires exactly once per coalesced batch, receiving the set
+/// of surviving paths, after `debounce` has elapsed with no further
+/// surviving events.
 fn watch_and_debounce<F>(
     root: &Path,
     debounce: Duration,
@@ -191,12 +280,18 @@ fn watch_and_debounce<F>(
 where
     F: FnMut(HashSet<PathBuf>) + Send + 'static,
 {
+    let root_owned = root.to_path_buf();
+    let scope = GitScope::load(root);
+
     let (event_tx, event_rx) = std_mpsc::channel::<PathBuf>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         match res {
             Ok(event) => {
                 for p in event.paths {
-                    if !is_path_excluded(&p) && event_tx.send(p).is_err() {
+                    if !is_path_excluded(&p)
+                        && scope.contains(&root_owned, &p)
+                        && event_tx.send(p).is_err()
+                    {
                         tracing::warn!("file watcher debounce thread is gone — event dropped");
                     }
                 }
@@ -346,6 +441,107 @@ mod tests {
     /// A batch that arrives while the driver is still processing a previous
     /// batch must be merged into ONE follow-up run, not spawn a second
     /// concurrent driver — proved directly against `CoalesceState`'s own
+    /// Parses a realistic multi-submodule `.gitmodules` (the same shape
+    /// nemo's own root repo carries — one `[submodule "name"]` block per
+    /// top-level subgit).
+    #[test]
+    fn read_gitmodule_paths_parses_every_declared_path() {
+        let dir = temp_watch_dir("gitmodules-parse");
+        std::fs::write(
+            dir.join(".gitmodules"),
+            "[submodule \"dig2memory\"]\n\
+             \tpath = dig2memory\n\
+             \turl = ../dig2memory\n\
+             [submodule \"uzor\"]\n\
+             \tpath = uzor\n\
+             \turl = ../uzor\n",
+        )
+        .expect("write .gitmodules");
+
+        let mut paths = read_gitmodule_paths(&dir);
+        paths.sort();
+        assert_eq!(paths, vec!["dig2memory".to_string(), "uzor".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_gitmodule_paths_is_empty_without_a_gitmodules_file() {
+        let dir = temp_watch_dir("gitmodules-missing");
+        assert!(read_gitmodule_paths(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Defect fix: the watcher must apply the same tracked-files scope a
+    /// full reindex applies (`index::indexer::collect_source_files`'s own
+    /// git-based rule) — proved against a real temp git repo with a
+    /// `.gitmodules` declaring one submodule directory.
+    #[test]
+    fn git_scope_matches_submodule_dirs_and_tracked_root_level_files() {
+        let root = temp_watch_dir("git-scope");
+
+        let git = |args: &[&str]| {
+            crate::proc::hidden("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git command runs")
+        };
+        assert!(git(&["init", "-q"]).status.success(), "git init must succeed");
+
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"sub-a\"]\n\tpath = sub-a\n\turl = ../sub-a\n",
+        )
+        .expect("write .gitmodules");
+        std::fs::create_dir_all(root.join("sub-a")).expect("create submodule dir");
+        std::fs::write(root.join("sub-a/inner.rs"), b"pub fn inner() {}\n").expect("write submodule file");
+        std::fs::write(root.join("CLAUDE.md"), b"# root doc\n").expect("write root-level file");
+        std::fs::create_dir_all(root.join("_deprecated")).expect("create scratch dir");
+        std::fs::write(root.join("_deprecated/stale.rs"), b"pub fn stale() {}\n").expect("write scratch file");
+
+        // Only the root-level file and `.gitmodules` itself are staged —
+        // `sub-a/inner.rs` is deliberately left untracked: submodule
+        // membership must count on directory alone, not on the file
+        // itself being tracked (checking a nested subrepo's own tracked
+        // set is out of scope for a cheap per-event check).
+        assert!(git(&["add", "CLAUDE.md", ".gitmodules"]).status.success(), "git add must succeed");
+
+        let scope = GitScope::load(&root);
+        assert!(scope.is_git_repo);
+        assert_eq!(scope.submodule_paths, vec!["sub-a".to_string()]);
+
+        assert!(
+            scope.contains(&root, &root.join("sub-a").join("inner.rs")),
+            "a path inside a declared submodule directory must count even when the file itself isn't tracked"
+        );
+        assert!(
+            scope.contains(&root, &root.join("CLAUDE.md")),
+            "a tracked root-level file must count"
+        );
+        assert!(
+            !scope.contains(&root, &root.join("_deprecated").join("stale.rs")),
+            "a path with a directory component outside any declared submodule must be out of scope"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_scope_allows_everything_when_root_is_not_a_git_repository() {
+        let dir = temp_watch_dir("git-scope-non-repo");
+        let scope = GitScope::load(&dir);
+        assert!(!scope.is_git_repo);
+        assert!(
+            scope.contains(&dir, &dir.join("anything/at/all.rs")),
+            "a non-git root must keep the old 'every non-excluded path counts' behaviour"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A batch that arrives while the driver is still processing a previous
+    /// batch must be merged into ONE follow-up run, not spawn a second
+    /// concurrent driver — proved directly against `CoalesceState`'s own
     /// invariant (the primitive `spawn_watcher`'s closure relies on), the
     /// same way `index::lock` tests the `IndexLocks` primitive directly
     /// rather than through a real reindex.
@@ -391,5 +587,111 @@ mod tests {
             [PathBuf::from("a.rs"), PathBuf::from("b.rs")].into_iter().collect::<HashSet<_>>(),
             "both batches must be merged into the single pending set: {merged:?}"
         );
+    }
+
+    /// Defect fix: `on_trigger` fires on the plain `m4a-watch-debounce` OS
+    /// thread, never on a Tokio worker thread — bare `tokio::spawn` from
+    /// there panicked with "there is no reactor running" (every filesystem
+    /// event after the first was then dropped, since the debounce thread
+    /// was dead). Runs `spawn_watcher` end-to-end over a real temp
+    /// database: a file written from a plain `std::thread` must reach the
+    /// real `Indexer::run_changed_paths` driver and land a `file_records`
+    /// row, proving the captured `Handle::spawn` path actually starts the
+    /// reindex driver from that thread instead of panicking on it.
+    #[tokio::test]
+    async fn a_trigger_fired_from_a_plain_std_thread_starts_the_reindex_driver() {
+        use crate::index::lock::IndexLocks;
+        use crate::server::state::AppState;
+        use crate::server::stats::StatsCache;
+        use crate::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool, MigrationRunner};
+        use std::sync::RwLock;
+
+        let dir = temp_watch_dir("reindex-driver");
+
+        let mut db_path = std::env::temp_dir();
+        db_path.push(format!(
+            "m4a-watch-reindex-driver-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+
+        let db = Db::open(&DbConfig::new(&db_path)).expect("writer db opens");
+        db.run_migrations(MigrationRunner::new(crate::storage::migrations::legacy_schema_migrations()))
+            .await
+            .expect("migration applies");
+        let reader_pool = DbPool::open_with_size(&DbConfig::new(&db_path), 2).expect("pool opens");
+        let writer = BatchWriter::new(db.clone(), BatchConfig::default());
+
+        let state: SharedState = Arc::new(AppState {
+            writer,
+            reader_pool: reader_pool.clone(),
+            data_dir: "test-data".to_string(),
+            stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+            index_locks: IndexLocks::new(),
+            last_index: Arc::new(RwLock::new(None)),
+        });
+
+        let root_path = dir.to_string_lossy().replace('\\', "/");
+        spawn_watcher(
+            state.clone(),
+            "ws".to_string(),
+            root_path,
+            WatchConfig {
+                enabled: true,
+                debounce: Duration::from_millis(100),
+            },
+        );
+
+        // Let the OS-level watch actually attach before writing.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Write the triggering file from a plain `std::thread` — the same
+        // kind of context (`notify`'s own callback thread, then the
+        // debounce thread) the panic happened on before the fix.
+        let file_path = dir.join("triggered.rs");
+        std::thread::spawn(move || {
+            std::fs::write(&file_path, b"pub fn triggered() {}\n").expect("write triggered file");
+        })
+        .join()
+        .expect("writer thread must not panic");
+
+        // Poll for the reindex driver's real DB write, well past the
+        // debounce window plus however long one small file takes to index.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut indexed = false;
+        while std::time::Instant::now() < deadline {
+            let count: i64 = reader_pool
+                .read(move |conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM file_records WHERE workspace_id = 'ws'",
+                        [],
+                        |r| r.get(0),
+                    )
+                })
+                .await
+                .expect("read file_records count");
+            if count > 0 {
+                indexed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            indexed,
+            "a filesystem event's debounced trigger (fired from the plain debounce thread) must \
+             start the reindex driver and land a file_records row — before the fix, spawning it \
+             via bare `tokio::spawn` from that thread panicked instead"
+        );
+
+        drop(state);
+        drop(reader_pool);
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -184,6 +184,7 @@ impl Indexer {
         };
 
         tracing::info!("{} files need indexing", files_to_index.len());
+        let scan_ms = start.elapsed().as_millis();
 
         // Phase 4: parse (CPU-bound, no DB) then write one WriteOp per file.
         // Each op re-resolves its own name→id map against the transaction
@@ -214,13 +215,25 @@ impl Indexer {
 
             tracing::info!("enqueued: {} files indexed so far", files_indexed);
         }
+        let parse_enqueue_ms = start.elapsed().as_millis() - scan_ms;
 
         // Phase 5: remove stale files — must see every Phase 4 write first.
         // `IndexScope::Full` diffs against a fresh disk walk (not the Phase
         // 2 snapshot); `IndexScope::Paths` only checks the given paths
         // themselves — no full re-walk — and deletes rows for exactly the
         // ones no longer on disk.
+        //
+        // This barrier is Phase 4's actual durability point: it waits for
+        // every one of the ~`files_indexed` per-file `WriteOp`s enqueued
+        // above to be committed by `BatchWriter`'s worker thread — folded
+        // into the final "index complete" line as `flush4_ms` so a
+        // regression in write throughput (vs. parse throughput, already
+        // covered by `parse_enqueue_ms` above) shows up on its own.
+        let before_flush4 = std::time::Instant::now();
         writer_handle.barrier_async().await;
+        let flush4_ms = before_flush4.elapsed().as_millis();
+
+        let before_stale_scan = std::time::Instant::now();
         match &scope {
             IndexScope::Full => {
                 let root_for_walk = root.clone();
@@ -257,6 +270,7 @@ impl Indexer {
                 }
             }
         }
+        let stale_scan_ms = before_stale_scan.elapsed().as_millis();
 
         // Phase 6: crate graph — discovers every submodule-rooted
         // `Cargo.toml` one level under `root` (piece 0.7; `nemo` itself has
@@ -277,6 +291,7 @@ impl Indexer {
         if !run_crate_graph_phase {
             tracing::debug!("skipping crate-graph phase — no Cargo.toml among changed paths");
         }
+        let before_crate_graph = std::time::Instant::now();
         if run_crate_graph_phase {
             let root_for_graph = root.clone();
             let wid = workspace_id.clone();
@@ -310,9 +325,14 @@ impl Indexer {
                 Err(e) => tracing::warn!("crate graph parse error: {e}"),
             }
         }
+        let crate_graph_ms = before_crate_graph.elapsed().as_millis();
 
         // Phase 7: recompute callsite_count / type_use_count — needs every
-        // call_edges/type_use_edges row from Phase 4 committed first.
+        // call_edges/type_use_edges row from Phase 4 committed first. The
+        // barrier right after `send` below (not this one) is what actually
+        // waits for these two `UPDATE`s to execute and commit — folded into
+        // the final line as `counts_ms`, the correlated-subquery `UPDATE`s'
+        // own cost isolated from every other phase's.
         writer_handle.barrier_async().await;
         {
             let wid = workspace_id.clone();
@@ -329,7 +349,9 @@ impl Indexer {
 
         // Phase 8: stamp indexed_at, then barrier so a caller that awaits
         // `run` sees committed data the instant this call returns.
+        let before_counts = std::time::Instant::now();
         writer_handle.barrier_async().await;
+        let counts_ms = before_counts.elapsed().as_millis();
         {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -350,7 +372,9 @@ impl Indexer {
         tracing::info!(
             "index complete for workspace={workspace_id}: \
              scanned={files_scanned}, indexed={files_indexed}, \
-             symbols={total_symbols}, errors={errors}, elapsed={elapsed_ms}ms"
+             symbols={total_symbols}, errors={errors}, elapsed={elapsed_ms}ms \
+             (scan={scan_ms}ms parse_enqueue={parse_enqueue_ms}ms flush4={flush4_ms}ms \
+             stale_scan={stale_scan_ms}ms crate_graph={crate_graph_ms}ms counts={counts_ms}ms)"
         );
 
         Ok(IndexResult {
@@ -542,7 +566,108 @@ struct ParsedFile {
 ///
 /// The set of supported extensions is determined by the enabled language features.
 /// Paths are normalised to forward slashes so they are consistent across platforms.
+///
+/// When `root` is a git repository, the file set is exactly its tracked
+/// files (`git_ls_files`) — filtered by extension and the shared exclusion
+/// names — instead of a raw [`WalkDir`] traversal. A `WalkDir` over a
+/// workspace root descends into every untracked directory it finds
+/// (scratch dirs, `_deprecated/`, `deploy*/`, nested non-submodule repos,
+/// …), which is how a full reindex of `nemo` once found ~219k files
+/// against a real tracked set of ~25-30k: `--recurse-submodules` alone
+/// already covers every submodule, so one `git` call is the whole
+/// workspace's scope. `root` not being a git repository (or the `git`
+/// command failing to run at all) falls back to the original `WalkDir`
+/// traversal unchanged.
 fn collect_source_files(root: &Path) -> Vec<(PathBuf, String, i64, i64)> {
+    match git_ls_files(root) {
+        Some(tracked) => stat_git_tracked_files(root, tracked),
+        None => collect_source_files_via_walkdir(root),
+    }
+}
+
+/// Runs `git -C root ls-files -z --recurse-submodules` and returns the
+/// tracked paths (forward-slash separated, relative to `root`) — `None` if
+/// `root` is not (recognized by git as) a repository or the command
+/// otherwise fails to run, signalling [`collect_source_files`] to fall
+/// back to [`collect_source_files_via_walkdir`].
+fn git_ls_files(root: &Path) -> Option<Vec<String>> {
+    let output = crate::proc::hidden("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "--recurse-submodules"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| String::from_utf8_lossy(chunk).replace('\\', "/"))
+            .collect(),
+    )
+}
+
+/// True if `root` is a git repository as far as `git` itself is concerned
+/// — used by [`crate::watch`] to gate its own tracked-files scope rule on
+/// exactly the same condition [`collect_source_files`] uses here (a
+/// non-git root keeps the watcher's old "every non-excluded path counts"
+/// behaviour, mirroring the `WalkDir` fallback above).
+pub(crate) fn is_git_repo(root: &Path) -> bool {
+    crate::proc::hidden("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Stats exactly the given git-tracked `rel` paths (used by
+/// [`collect_source_files`] instead of a `WalkDir` traversal) and returns
+/// `(abs_path, rel_path, mtime, size)` for each one that passes the shared
+/// exclusion-name filter, has a supported extension, and can still be
+/// stat'd (a file git has recorded but that vanished from disk between the
+/// `ls-files` call and now is silently skipped — same "caller learns about
+/// it on the next pass" discipline [`stat_candidate_files`] already uses).
+fn stat_git_tracked_files(root: &Path, tracked: Vec<String>) -> Vec<(PathBuf, String, i64, i64)> {
+    let mut result = Vec::with_capacity(tracked.len());
+
+    for rel in tracked {
+        if is_relpath_excluded(&rel) {
+            continue;
+        }
+        let ext = match Path::new(&rel).extension().and_then(|e| e.to_str()) {
+            Some(e) => e,
+            None => continue,
+        };
+        if !registry::is_supported_extension(ext) {
+            continue;
+        }
+
+        let abs = root.join(&rel);
+        let meta = match abs.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("metadata error for {}: {}", abs.display(), e);
+                continue;
+            }
+        };
+
+        let mtime = file_mtime(&meta);
+        let size = meta.len() as i64;
+        result.push((abs, rel, mtime, size));
+    }
+
+    result
+}
+
+/// `WalkDir`-based fallback used by [`collect_source_files`] when `root`
+/// is not a git repository — the original (pre-git-scope) traversal,
+/// unchanged.
+fn collect_source_files_via_walkdir(root: &Path) -> Vec<(PathBuf, String, i64, i64)> {
     let mut result = Vec::new();
 
     for entry in WalkDir::new(root)
@@ -633,7 +758,11 @@ fn stat_candidate_files(root: &Path, paths: &[PathBuf]) -> Vec<(PathBuf, String,
 /// here as `C:\…` from a filesystem event and as `c:/…` from a stored
 /// workspace root, and a case-sensitive strip would store the absolute path
 /// as a second row for the same file.
-fn to_relative(root: &Path, abs: &Path) -> String {
+///
+/// `pub(crate)` so `crate::watch`'s git-scope check can turn a raw
+/// filesystem-event path into the same relative form
+/// [`stat_git_tracked_files`]'s `git ls-files` output already is in.
+pub(crate) fn to_relative(root: &Path, abs: &Path) -> String {
     let abs_str = abs.to_string_lossy().replace('\\', "/");
     let root_str = root.to_string_lossy().replace('\\', "/");
     let n = root_str.len();
@@ -683,6 +812,25 @@ pub(crate) fn is_excluded_name(name: &str, is_dir: bool) -> bool {
     )
 }
 
+/// [`is_excluded_name`] applied to a whole `/`-separated relative path
+/// (git's own path separator, regardless of platform) instead of one
+/// `walkdir::DirEntry`/path component — used by [`stat_git_tracked_files`].
+/// Every directory component is checked with `is_dir = true` (so a hidden
+/// or named-excluded ancestor directory is caught, matching `WalkDir`'s own
+/// pruning); the final component (the file itself) is checked with
+/// `is_dir = false`, matching `WalkDir`'s per-entry semantics where a
+/// hidden FILE is never excluded merely for its name.
+pub(crate) fn is_relpath_excluded(rel: &str) -> bool {
+    let mut parts = rel.split('/').peekable();
+    while let Some(part) = parts.next() {
+        let is_dir = parts.peek().is_some();
+        if is_excluded_name(part, is_dir) {
+            return true;
+        }
+    }
+    false
+}
+
 fn file_mtime(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
@@ -709,6 +857,101 @@ mod tests {
         assert_eq!(to_relative(root, Path::new("/srv/other/a.rs")), "/srv/other/a.rs");
         assert_eq!(to_relative(root, Path::new("/srv/nemo/a.rs")), "a.rs");
     }
+
+    #[test]
+    fn is_relpath_excluded_matches_the_shared_exclusion_list() {
+        assert!(is_relpath_excluded("target/debug/foo.rs"));
+        assert!(is_relpath_excluded(".git/HEAD"));
+        assert!(is_relpath_excluded("node_modules/x/index.js"));
+        assert!(!is_relpath_excluded("src/lib.rs"));
+        // A hidden ancestor DIRECTORY is excluded; a hidden leaf FILE by
+        // itself is not — matches `WalkDir`'s own per-entry semantics.
+        assert!(is_relpath_excluded(".hidden/lib.rs"));
+        assert!(!is_relpath_excluded("src/.env"));
+        // "build.rs" (a plain Rust build script filename) must never match
+        // the "build" directory-name exclusion.
+        assert!(!is_relpath_excluded("build.rs"));
+        assert!(is_relpath_excluded("build/output.rs"));
+    }
+
+    /// Defect fix: a raw `WalkDir` traversal of a workspace root descends
+    /// into every untracked directory it finds (scratch dirs, nested
+    /// non-submodule repos, …) — this is what made a full reindex of
+    /// `nemo` report ~219k files against a real tracked set of ~25-30k.
+    /// When `root` is a git repository, `collect_source_files` must use
+    /// exactly its tracked files (filtered by extension/exclusion names)
+    /// instead — proved here against a real temp git repo rather than a
+    /// mocked git command.
+    #[test]
+    fn collect_source_files_uses_git_scope_when_root_is_a_repository() {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "m4a-indexer-git-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root dir");
+
+        let git = |args: &[&str]| {
+            crate::proc::hidden("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git command runs")
+        };
+        assert!(git(&["init", "-q"]).status.success(), "git init must succeed");
+        assert!(is_git_repo(&root), "a freshly init'd repo must be recognized as one");
+
+        write_rust_file(&root, "tracked.rs", "pub fn tracked() {}\n");
+        write_rust_file(&root, "untracked_scratch.rs", "pub fn scratch() {}\n");
+        write_rust_file(&root, "target/debug/build_output.rs", "pub fn out() {}\n");
+
+        // `git add` is enough to make `git ls-files` see a path — no
+        // commit (and no configured identity) needed.
+        assert!(
+            git(&["add", "tracked.rs", "target/debug/build_output.rs"]).status.success(),
+            "git add must succeed"
+        );
+
+        let files = collect_source_files(&root);
+        let rels: HashSet<String> = files.into_iter().map(|(_, rel, _, _)| rel).collect();
+
+        assert!(rels.contains("tracked.rs"), "a tracked source file must be in scope: {rels:?}");
+        assert!(
+            !rels.contains("untracked_scratch.rs"),
+            "an untracked scratch file must be out of scope under the git rule: {rels:?}"
+        );
+        assert!(
+            !rels.contains("target/debug/build_output.rs"),
+            "a tracked file under an excluded directory name must still be filtered: {rels:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_git_repo_is_false_for_a_plain_non_git_directory() {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "m4a-indexer-not-a-repo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root dir");
+
+        assert!(!is_git_repo(&root), "a plain directory with no .git must not be a repo");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use crate::index::lock::IndexLocks;
     use crate::storage::{BatchConfig, Db, DbConfig, MigrationRunner};
     use std::io::Write as _;

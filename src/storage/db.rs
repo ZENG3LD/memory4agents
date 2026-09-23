@@ -82,6 +82,16 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(DbError::Pragma)?;
 
+        // `db::writer`'s hot indexing path (`insert_symbol`, `insert_symbol_trigrams`,
+        // `insert_call_edge`, …) uses `Connection::prepare_cached` so a
+        // statement compiled once is reused for the connection's whole
+        // lifetime instead of being re-parsed by SQLite on every single
+        // row — the dominant cost a plain `execute` call pays per row.
+        // rusqlite's default capacity (16) already covers today's ~11
+        // distinct hot statements; raised here so a later addition doesn't
+        // silently start evicting and re-compiling.
+        conn.set_prepared_statement_cache_capacity(64);
+
         info!(path = %label, "memory4agent db opened");
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),

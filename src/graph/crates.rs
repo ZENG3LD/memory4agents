@@ -83,14 +83,23 @@ fn parse_one_manifest(
     strip_root: &Path,
     workspace_id: &str,
 ) -> Result<(Vec<CrateNode>, Vec<DepEdge>), CoreError> {
-    let metadata = MetadataCommand::new()
-        .manifest_path(manifest_path)
-        .no_deps()
-        .exec()
-        .map_err(|e| CoreError::Manifest {
-            path: manifest_path.to_string_lossy().replace('\\', "/"),
-            reason: e.to_string(),
-        })?;
+    // Run `cargo metadata` ourselves (hidden window, see `crate::proc`) and
+    // only let `cargo_metadata` parse its output: `MetadataCommand::exec`
+    // spawns a visible console window per submodule on Windows.
+    let manifest_err = |reason: String| CoreError::Manifest {
+        path: manifest_path.to_string_lossy().replace('\\', "/"),
+        reason,
+    };
+    let output = crate::proc::hidden("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps", "--manifest-path"])
+        .arg(manifest_path)
+        .output()
+        .map_err(|e| manifest_err(e.to_string()))?;
+    if !output.status.success() {
+        return Err(manifest_err(String::from_utf8_lossy(&output.stderr).trim().to_string()));
+    }
+    let metadata = MetadataCommand::parse(String::from_utf8_lossy(&output.stdout))
+        .map_err(|e| manifest_err(e.to_string()))?;
 
     let root_str = strip_root.to_string_lossy().replace('\\', "/");
     // Ensure root_str has no trailing slash for consistent prefix stripping.
