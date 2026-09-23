@@ -1,6 +1,12 @@
-# dig2memory
+# memory4agent
 
-Code intelligence server and CLI for AI agents. Indexes codebases using tree-sitter AST parsing, builds dependency graphs, and provides fuzzy symbol search, caller tracking, and impact analysis.
+Code-intelligence and memory infrastructure for coding agents (Claude Code,
+Codex, Kimi, Grok CLIs and others). Indexes codebases using tree-sitter AST
+parsing, builds dependency graphs, and provides fuzzy symbol search, caller
+tracking, and impact analysis. Formerly published as `dig2memory` — this is
+the same server and CLI, renamed and under active extension (MCP tool
+surface, SCIP precise index, personalized-PageRank repo map, a decision
+log, and hybrid BM25+vector retrieval are all in progress).
 
 **Supported languages**: Rust, TypeScript/JavaScript (TSX/JSX), Python, Go
 
@@ -19,14 +25,22 @@ Built for [Claude Code](https://claude.ai/code) agents but works with any AI cod
 
 ## Architecture
 
+A single Cargo package with two binaries, not a multi-crate split:
+
 ```
-dig2memory/
-├── dig2memory-core/     # Library: AST parsing, SQLite storage, graph queries
-├── dig2memory-server/   # HTTP server (axum, localhost:18200)
-├── dig2memory-cli/      # CLI binary (reads SQLite directly, no server needed)
-├── skills/              # Claude Code skill template
-├── agents/              # Claude Code agent template
-└── data/                # SQLite database (gitignored)
+src/
+├── ast/          # tree-sitter parsing, symbol/call/fingerprint extraction, one module per language
+├── db/           # original storage: Arc<Mutex<Connection>>, shared by every route + the indexer
+├── storage/      # replacement storage engine: Db (single writer) + DbPool (read-only pool) +
+│                 # BatchWriter (batched, SAVEPOINT-isolated writes) + versioned migrations —
+│                 # not yet wired onto AppState/the indexer, see CLAUDE.md's "Storage engine"
+├── graph/        # crate dependency graph (cargo_metadata) + file dependency graph
+├── index/        # the indexer: walks a workspace, parses, writes symbols/edges
+├── search/       # trigram fuzzy search
+├── server/       # axum HTTP server: routes, AppState, registration, stats cache
+└── bin/
+    ├── server.rs # memory4agent-server — the HTTP daemon (this is what d-watchdog runs)
+    └── cli.rs    # memory4agent — CLI, reads the SQLite index directly, no server needed
 ```
 
 **Stack**: tree-sitter (Rust/TS/Python/Go grammars), rusqlite (bundled), cargo_metadata, clap, axum + tokio (server only)
@@ -44,8 +58,8 @@ cargo build --release --no-default-features --features lang-rust
 ```
 
 This produces two binaries:
-- `target/release/dig2memory` — CLI (recommended for AI agents)
-- `target/release/dig2memory-server` — HTTP server
+- `target/release/memory4agent` — CLI (recommended for AI agents)
+- `target/release/memory4agent-server` — HTTP server
 
 ### Feature Flags
 
@@ -62,7 +76,7 @@ Start the server and trigger indexing:
 
 ```bash
 # Start server
-DIG2MEMORY_DATA_DIR="./data" ./target/release/dig2memory-server &
+MEMORY4AGENT_DATA_DIR="./data" ./target/release/memory4agent-server &
 
 # Index your workspace
 curl -s -X POST http://127.0.0.1:18200/index \
@@ -82,7 +96,7 @@ Indexing is incremental — only changed files are re-parsed on subsequent runs.
 ```bash
 # Set up shortcuts
 DB="./data/index.db"
-DM="./target/release/dig2memory"
+DM="./target/release/memory4agent"
 
 # Search for a symbol
 "$DM" --db "$DB" search "MyStruct"
@@ -129,11 +143,13 @@ All endpoints return JSON. Default port: 18200.
 | `/graph/hotspots?workspace=ID&limit=N` | GET | Most connected files |
 | `/graph/resolve?sym=NAME&workspace=ID` | GET | Symbol-to-crate mapping |
 
+See `CLAUDE.md` for the full endpoint list (duplicate/dead-code/usage analysis routes).
+
 ## Claude Code Integration
 
 ### As a Skill
 
-Copy `skills/dig2memory/SKILL.md` to your project's `.claude/skills/dig2memory/SKILL.md`. Then use `/dig2memory search MyStruct` in Claude Code.
+Copy `skills/dig2memory/SKILL.md` to your project's `.claude/skills/memory4agent/SKILL.md`. Then use `/memory4agent search MyStruct` in Claude Code.
 
 ### As an Agent
 
@@ -141,12 +157,12 @@ Copy `agents/refactoring-explorer.md` to your project's `.claude/agents/`. This 
 
 ### In CLAUDE.md
 
-Add CLI instructions to your project's `CLAUDE.md` so all agents know about dig2memory:
+Add CLI instructions to your project's `CLAUDE.md` so all agents know about memory4agent:
 
 ```markdown
-## dig2memory (Code Intelligence)
+## memory4agent (Code Intelligence)
 
-CLI: `dig2memory/target/release/dig2memory --db dig2memory/data/index.db`
+CLI: `memory4agent/target/release/memory4agent --db memory4agent/data/index.db`
 
 Commands: search, symbols, callers, deps, impact, hotspots, crates, resolve
 Add --json for structured output.
@@ -162,7 +178,7 @@ Tested on a mixed-language workspace (Rust + TS + Python + Go):
 | Symbols extracted | 580,612 |
 | Full index | ~5 min |
 | Incremental re-index | seconds |
-| Database size | ~700 MB |
+| Database size | ~2.76 GB |
 | Symbol search | <50ms |
 | Callers query | <100ms |
 

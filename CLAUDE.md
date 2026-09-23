@@ -1,25 +1,109 @@
-# dig2memory — Code Intelligence Server
+# memory4agent — Code Intelligence Server
+
+Renamed from `dig2memory` (2026-09-23) — this crate is code-intelligence and
+memory infrastructure for coding agents (Claude Code, Codex, Kimi, Grok CLIs),
+not just an AST index. The rename plan is
+`docs/memory4agent/plans/2026-09-23-memory4agent-plan.md`; read its
+"Executor amendments" section first, it overrides the phase text below it.
 
 - **Port**: 18200 (range 18200-18299)
-- **What**: AST index + dependency graph + fuzzy search over entire nemo workspace
-- **Stack**: tree-sitter-rust, SQLite (WAL), axum, cargo_metadata
-- **Location**: `dig2memory/` submodule (2 crates: core + server)
-- **DB**: `data/index.db` (~700MB, 250K symbols, 13K files)
-- **Agent access**: Only agents with Bash + `permissionMode: default` can curl. WebFetch doesn't reach localhost (runs on Anthropic servers). Agents with `dontAsk` don't get Bash even if listed in tools.
-- **Dedicated agent**: `refactoring-explorer` — deep analysis agent with Bash+Grep+Read, 200 turns. Use ONLY when task touches 2+ crates (cross-crate deps, impact analysis). For simple exploration use regular `explorer`.
+- **What today**: AST index + dependency graph + fuzzy search over entire
+  nemo workspace. Later phases (see the plan) add an MCP server, a SCIP
+  precise index, personalized-PageRank repo-map, a decision log, and a
+  hybrid BM25+vector retrieval core.
+- **Stack**: tree-sitter (Rust/TS/Python/Go grammars), SQLite (WAL), axum,
+  cargo_metadata.
+- **Location**: this directory is still named `dig2memory/` on disk — the
+  directory/repo rename is plan piece 0.1, deliberately deferred to land
+  together with the first deploy of the renamed binary. The crate/package
+  name, both binaries, env vars, and the d-watchdog service name are
+  `memory4agent` already (piece 0.2).
+- **Binaries**: `memory4agent-server` (HTTP daemon) and `memory4agent` (CLI,
+  reads the SQLite index directly — no server needed).
+- **DB**: `./data/index.db` (~2.76 GB, ~580K symbols, ~30K files
+  as of 2026-09). The on-disk directory name is unchanged by the rename —
+  only the env var that points at it changed name (`MEMORY4AGENT_DATA_DIR`).
+  The 126 KB `dig2memory/data/index.db` some older docs pointed at is a
+  stale stub, not the live database — always use the env-var path.
+- **Agent access**: Only agents with Bash + `permissionMode: default` can
+  curl. WebFetch doesn't reach localhost (runs on Anthropic servers). Agents
+  with `dontAsk` don't get Bash even if listed in tools.
+- **Dedicated agent**: `refactoring-explorer` — deep analysis agent with
+  Bash+Grep+Read, 200 turns. Use ONLY when task touches 2+ crates
+  (cross-crate deps, impact analysis). For simple exploration use regular
+  `explorer`.
 - **New agents need IDE restart** to register.
-- **DB access from a route handler**: always `crate::server::state::with_db(&state, move |conn| { ... })` — runs the closure in `spawn_blocking` and takes/releases the `state.db` mutex entirely inside it. Never `state.db.lock()` directly inside an `async fn` handler (that locks/queries on a tokio worker thread and can starve other routes). `/health` is the one exception: it never touches `state.db` at all, see below.
+- **DB access from a route handler**: always
+  `crate::server::state::with_db(&state, move |conn| { ... })` — runs the
+  closure in `spawn_blocking` and takes/releases the `state.db` mutex
+  entirely inside it. Never `state.db.lock()` directly inside an `async fn`
+  handler (that locks/queries on a tokio worker thread and can starve other
+  routes). `/health` is the one exception: it never touches `state.db` at
+  all, see below. This rule describes the storage every route still uses
+  today (`crate::db`) — see "Storage engine" below for what's replacing it.
+
+## Storage engine (mid-migration)
+
+Two storage layers currently coexist in this crate, deliberately, across a
+sequence of gated pieces (plan phase 0):
+
+- **`crate::db`** — the original storage: one `Arc<Mutex<rusqlite::Connection>>`
+  shared by every route AND the indexer, taken via `spawn_blocking` at every
+  call site. This is what every route handler and the indexer actually run
+  against today. Its known defect: one heavy analytics route holds the
+  global mutex for the query's whole duration, blocking every other route
+  (including `/index`) for as long as it runs.
+- **`crate::storage`** — the replacement engine (pieces 0.3-0.4 landed;
+  0.5-0.9 pending), modeled on `servertoolkit-db` the way
+  `mail4agent-store-sqlite` modeled the same source — own types in this
+  crate, no `servertoolkit` dependency:
+  - `storage::Db` — the sole writer connection (WAL + foreign_keys=ON),
+    never exposed to a route handler; only `storage::BatchWriter` and the
+    migration bootstrap touch it.
+  - `storage::DbPool` — N read-only connections (`MEMORY4AGENT_READER_POOL_SIZE`,
+    default 8), each additionally pragma'd `query_only = ON` so an
+    accidental write on a pooled connection fails loudly
+    (`SQLITE_READONLY`) instead of racing the writer silently.
+  - `storage::BatchWriter` — one dedicated worker thread draining a queue
+    into batched transactions (`max_ops` 256 or `flush_window` 50ms,
+    whichever first), one `SAVEPOINT` per op so a single op's failure
+    doesn't lose the rest of the batch, `barrier()`/`barrier_async()` as the
+    durability point, `stats()` for enqueued/committed/failed/batches.
+  - `storage::migrations` — `Migration` + `MigrationRunner`, a versioned
+    `schema_migrations(version, label, applied_at)` ledger (replacing
+    `crate::db::schema::init_schema`'s swallow-errors `ALTER TABLE` chain),
+    plus `seed_legacy_versions_if_needed` — a one-time backfill that
+    inspects an existing database's columns/tables and records which
+    legacy versions (v1-v7, mirroring `crate::db::schema`'s own history) are
+    already satisfied, without re-running their SQL. This is what lets the
+    live 2.76 GB database adopt the new ledger without a "duplicate column"
+    failure on first boot under the new code.
+
+**Nothing is wired onto `storage::*` yet** — `AppState`, every route, and
+the indexer still run on `crate::db` exactly as before. That rewiring
+(`AppState` swapping to `{writer, reader_pool}`, `with_db`'s body changing
+from mutex-lock to `reader_pool.read(...)`, the indexer's write path moving
+to per-file `WriteOp`s) is plan piece 0.5 onward — a separate, larger change
+gated on its own. Until it lands, `crate::storage` is covered entirely by
+its own unit tests (`cargo test -p memory4agent --release --lib storage::`).
 
 ## Starting the server
 
 ```bash
-cd dig2memory && cargo run --release --bin dig2memory-server
+cd dig2memory && cargo run --release --bin memory4agent-server
 ```
 
 Or with explicit data dir:
 ```bash
-cd dig2memory && DIG2MEMORY_DATA_DIR="./data" ./target/release/dig2memory-server.exe &
+cd dig2memory && MEMORY4AGENT_DATA_DIR="./data" ./target/release/memory4agent-server.exe &
 ```
+
+Env vars: `MEMORY4AGENT_PORT` (default 18200), `MEMORY4AGENT_DATA_DIR`
+(default `./data`; the live service sets this to `./data`),
+`MEMORY4AGENT_READER_POOL_SIZE` (default 8, read but not yet wired — see
+"Storage engine" above). The CLI's `--db` flag overrides both env vars; if
+unset it checks `MEMORY4AGENT_DATA_DIR` then falls back to the legacy
+`DIG2MEMORY_DATA_DIR` for scripts/agent configs written before the rename.
 
 ## Re-index (incremental — only changed files)
 
@@ -29,7 +113,7 @@ curl -X POST "http://127.0.0.1:18200/index" \
   -d '{"workspace_id":"nemo","workspace_name":"nemo","root_path":"c:/src/nemo","force":false}'
 ```
 
-## API (all GET, all return JSON)
+## API (all GET unless noted, all return JSON)
 
 | Endpoint | Use case |
 |----------|----------|
@@ -62,9 +146,19 @@ curl -X POST "http://127.0.0.1:18200/index" \
 | `/health` | Pure liveness probe — never touches the database. Returns the LAST KNOWN stats from an in-memory cache (`ok`, `db_path`, `workspace_count`, `symbol_count`, `file_count`, `stats_age_secs`), refreshed by a background task every 30s (`STATS_REFRESH_INTERVAL`, `src/server/stats.rs`). Answers instantly even while `/index` or a heavy `/ast`/`/graph`/`/usage` query holds the DB lock. |
 | `/ready` | Readiness probe — runs a bounded (3s) `SELECT 1` via `spawn_blocking`; `503` if the DB is currently unreachable/locked rather than hanging. |
 
+`POST /index` triggers indexing (see "Re-index" above).
+
 ## impl_trait tracking (v0.2.10+)
 
-Column `impl_trait TEXT` on `symbols` — populated for `kind=impl` only. NULL for inherent impls. Use `/ast/impls`, `/ast/inherent_impls`, `/ast/impl_summary` endpoints. `/ast/find_twins` returns `implementors` section when seed is a trait.
+Column `impl_trait TEXT` on `symbols` — populated for `kind=impl` only. NULL
+for inherent impls. Use `/ast/impls`, `/ast/inherent_impls`,
+`/ast/impl_summary` endpoints. `/ast/find_twins` returns `implementors`
+section when seed is a trait. All four `LanguageSupport` implementations
+(`rust`/`ast/symbols.rs`, `typescript`, `python`, `go`) must set this field
+on every `Symbol` they construct — a missing field here is a compile error,
+not a runtime gap, since `Symbol` has no `Default` impl by design (every
+field is a deliberate extraction decision, not a value that's safe to
+default silently).
 
 ## Synonym token map (v0.2.9+)
 

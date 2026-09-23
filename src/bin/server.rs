@@ -1,12 +1,12 @@
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
-use dig2memory::db::schema::init_schema;
-use dig2memory::server::config::Config;
-use dig2memory::server::registration;
-use dig2memory::server::state::{AppState, SharedState};
-use dig2memory::server::stats::{spawn_stats_refresher, StatsCache};
-use dig2memory::server::routes;
+use memory4agent::db::schema::init_schema;
+use memory4agent::server::config::Config;
+use memory4agent::server::registration;
+use memory4agent::server::state::{AppState, SharedState};
+use memory4agent::server::stats::{spawn_stats_refresher, StatsCache};
+use memory4agent::server::routes;
 use nemo_service::register;
 
 #[tokio::main]
@@ -36,7 +36,7 @@ async fn main() {
     let app = router.with_state(state);
 
     let addr = format!("127.0.0.1:{}", config.port);
-    tracing::info!("dig2memory-server listening on {}", addr);
+    tracing::info!("memory4agent-server listening on {}", addr);
 
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
 

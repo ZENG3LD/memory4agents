@@ -1,8 +1,8 @@
 [package]
-name = "dig2memory"
+name = "memory4agent"
 version = "0.2.10"
 edition = "2021"
-description = "AST index and dependency graph server for code intelligence"
+description = "Code-intelligence and memory infrastructure for coding agents: AST index, dependency graph, and fuzzy search server"
 license = "MIT"
 repository = "https://github.com/ZENG3LD/dig2memory"
 
@@ -17,11 +17,11 @@ lang-go = ["dep:tree-sitter-go"]
 watcher = ["dep:notify"]
 
 [[bin]]
-name = "dig2memory-server"
+name = "memory4agent-server"
 path = "src/bin/server.rs"
 
 [[bin]]
-name = "dig2memory"
+name = "memory4agent"
 path = "src/bin/cli.rs"
 
 [dependencies]

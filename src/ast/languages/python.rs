@@ -92,6 +92,7 @@ fn collect_symbols(
                     shape_summary: None,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
             }
         }
@@ -117,6 +118,7 @@ fn collect_symbols(
                     shape_summary: None,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
                 // Walk class body with class name as parent.
                 if let Some(body) = node.child_by_field_name("body") {
@@ -165,7 +167,8 @@ fn collect_symbols(
                                     field_count: None,
                                     shape_summary: None,
                                     callsite_count: 0,
-                    type_use_count: 0,
+                                    type_use_count: 0,
+                                    impl_trait: None,
                                 });
                             }
                         }

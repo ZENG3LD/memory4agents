@@ -1,12 +1,12 @@
 use clap::{Parser, Subcommand};
-use dig2memory::db::reader;
-use dig2memory::search::trigram::fuzzy_search;
+use memory4agent::db::reader;
+use memory4agent::search::trigram::fuzzy_search;
 use rusqlite::Connection;
 use std::path::PathBuf;
 use std::process;
 
 #[derive(Parser)]
-#[command(name = "dig2memory", about = "Code intelligence CLI — reads SQLite index directly")]
+#[command(name = "memory4agent", about = "Code intelligence CLI — reads SQLite index directly")]
 struct Cli {
     /// Path to SQLite database
     #[arg(long, global = true)]
@@ -54,6 +54,13 @@ enum Command {
 fn resolve_db_path(flag: Option<PathBuf>) -> PathBuf {
     if let Some(p) = flag {
         return p;
+    }
+    // `MEMORY4AGENT_DATA_DIR` is the current name; `DIG2MEMORY_DATA_DIR` is
+    // kept as a fallback so a shell/agent config written before this rename
+    // still resolves to the same on-disk directory (which itself is not
+    // renamed — see plan piece 0.1).
+    if let Ok(dir) = std::env::var("MEMORY4AGENT_DATA_DIR") {
+        return PathBuf::from(dir).join("index.db");
     }
     if let Ok(dir) = std::env::var("DIG2MEMORY_DATA_DIR") {
         return PathBuf::from(dir).join("index.db");

@@ -57,6 +57,7 @@ fn collect_symbols(
                     shape_summary: None,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
             }
         }
@@ -99,6 +100,7 @@ fn collect_symbols(
                     shape_summary: None,
                     callsite_count: 0,
                     type_use_count: 0,
+                    impl_trait: None,
                 });
             }
         }
@@ -137,6 +139,7 @@ fn collect_symbols(
                             shape_summary: None,
                             callsite_count: 0,
                             type_use_count: 0,
+                            impl_trait: None,
                         });
                     }
                 }
@@ -169,6 +172,7 @@ fn collect_symbols(
                             shape_summary: None,
                             callsite_count: 0,
                             type_use_count: 0,
+                            impl_trait: None,
                         });
                     }
                 }
@@ -200,6 +204,7 @@ fn collect_symbols(
                             shape_summary: None,
                             callsite_count: 0,
                             type_use_count: 0,
+                            impl_trait: None,
                         });
                     }
                 }

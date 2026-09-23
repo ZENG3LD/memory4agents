@@ -1,37 +1,42 @@
-//! Builds the `nemo_service::manifest::ServiceManifest` dig2memory-server
-//! asserts about itself via `PUT /registry/dig2memory-server` (see
+//! Builds the `nemo_service::manifest::ServiceManifest` memory4agent-server
+//! asserts about itself via `PUT /registry/memory4agent-server` (see
 //! `bin/server.rs`'s call to `nemo_service::register::spawn`). `endpoints`
 //! is the list `crate::server::routes::build_router` recorded while
 //! building the real router via `nemo_service::router::DocRouter` — there
 //! is exactly one place a route is described. Replaces the hand-written
 //! `.nemo-service.toml`, deleted in the same commit as this module.
+//!
+//! The old `dig2memory-server` registry entry this replaces is orphaned by
+//! the rename (a new manifest name, not an update to the old one) and is
+//! removed via the watchdog API separately — see
+//! `.claude/rules/d-watchdog-service-update.md` and plan piece 0.1.
 
 use nemo_service::manifest::{
     Dependencies, Endpoint, HealthInfo, Links, ManageAction, ParamSpec, ServiceManifest, ServiceMeta,
 };
 
-/// `dig2memory/CLAUDE.md`'s own one-line description, carried over verbatim
-/// from the retired `.nemo-service.toml`.
-const SERVICE_DESCRIPTION: &str = "AST index + dependency graph + fuzzy search server (port 18200)";
+/// `memory4agent/CLAUDE.md`'s own one-line description, carried over from
+/// the retired `.nemo-service.toml` (originally written for dig2memory).
+const SERVICE_DESCRIPTION: &str = "AST index + dependency graph + fuzzy search server for coding agents (port 18200)";
 
-/// Build the manifest dig2memory-server asserts about itself. `endpoints`
+/// Build the manifest memory4agent-server asserts about itself. `endpoints`
 /// is the list `crate::server::routes::build_router` recorded while
 /// building the real router — passed in rather than rebuilt here so there
 /// is exactly one place a route is described. `port` is the bind port
-/// actually read from `Config` (`DIG2MEMORY_PORT`, default 18200), so
+/// actually read from `Config` (`MEMORY4AGENT_PORT`, default 18200), so
 /// `links.local_url` can never drift from what the daemon actually bound
 /// to.
 ///
 /// No `key_ref` anywhere in this manifest: every route on this server is
 /// unauthenticated (`auth = "none"`, see each router's `RouteDoc`) — there
-/// is no bearer, session, or API key to name. `dig2memory-server` relies
+/// is no bearer, session, or API key to name. `memory4agent-server` relies
 /// entirely on binding to `127.0.0.1` for its access control.
 pub fn service_manifest(endpoints: Vec<Endpoint>, port: u16) -> ServiceManifest {
     ServiceManifest {
         service: ServiceMeta {
-            name: "dig2memory-server".to_string(),
+            name: "memory4agent-server".to_string(),
             kind: "service".to_string(),
-            display_name: Some("dig2memory".to_string()),
+            display_name: Some("memory4agent".to_string()),
             description: Some(SERVICE_DESCRIPTION.to_string()),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
             key_ref: None,
@@ -40,8 +45,8 @@ pub fn service_manifest(endpoints: Vec<Endpoint>, port: u16) -> ServiceManifest 
             public_url: None,
             local_url: Some(format!("http://127.0.0.1:{port}")),
             admin_url: None,
-            docs: Some("dig2memory/README.md".to_string()),
-            repo: Some("dig2memory".to_string()),
+            docs: Some("memory4agent/README.md".to_string()),
+            repo: Some("memory4agent".to_string()),
         },
         endpoints,
         manage_actions: vec![
