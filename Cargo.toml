@@ -47,6 +47,10 @@ axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# d-watchdog registry client: `router::DocRouter` builds the route table and
+# records its own endpoint list; `register::spawn` pushes that list as this
+# service's self-asserted manifest (see `src/server/registration.rs`).
+nemo-service = { path = "../nemo-service", default-features = false, features = ["axum", "client"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

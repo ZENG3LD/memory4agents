@@ -1,8 +1,8 @@
 use axum::{
     extract::{Query, State},
-    routing::get,
-    Json, Router,
+    Json,
 };
+use nemo_service::router::{DocRouter, RouteDoc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -12,19 +12,104 @@ use crate::db::reader;
 use crate::server::state::{with_db, AppError, SharedState};
 use crate::types::Symbol;
 
-pub fn router() -> Router<SharedState> {
-    Router::new()
-        .route("/ast/cluster", get(cluster))
-        .route("/ast/parallel_systems", get(parallel_systems))
-        .route("/ast/dead_in_group", get(dead_in_group))
-        .route("/ast/type_usage", get(type_usage))
-        .route("/ast/dead_types", get(dead_types))
-        .route("/ast/usage_hotspots", get(usage_hotspots))
-        .route("/ast/orphans", get(orphans))
-        .route("/ast/role_groups", get(role_groups))
-        .route("/ast/find_twins", get(find_twins))
-        .route("/ast/workspace_summary", get(workspace_summary))
-        .route("/ast/cleanup_plan", get(cleanup_plan))
+pub fn router() -> DocRouter<SharedState> {
+    DocRouter::new()
+        .get(
+            "/ast/cluster",
+            cluster,
+            RouteDoc::new(
+                "BFS use-graph around a seed type: nodes + edges to depth N \
+                 (?seed=NAME&workspace=ID&depth=N&path_prefix=P&include_dead=bool)",
+            )
+            .public(),
+        )
+        .get(
+            "/ast/parallel_systems",
+            parallel_systems,
+            RouteDoc::new(
+                "Weakly-connected components of the structural type graph plus parallel-candidate \
+                 pairs by profile distance; mode=token for semantic name-token clustering \
+                 (?workspace=ID&path_prefix=P&min_size=N&mode=wcc|token)",
+            )
+            .public(),
+        )
+        .get(
+            "/ast/dead_in_group",
+            dead_in_group,
+            RouteDoc::new(
+                "All symbols sharing a shape fingerprint, each flagged is_dead by callsite_count \
+                 (?fingerprint=HASH&workspace=ID)",
+            )
+            .public(),
+        )
+        .get(
+            "/ast/type_usage",
+            type_usage,
+            RouteDoc::new(
+                "Who uses a name as a type: per-definition member list plus users from \
+                 type_use_edges (?name=NAME&workspace=ID&path_prefix=P&breakdown=bool)",
+            )
+            .public(),
+        )
+        .get(
+            "/ast/dead_types",
+            dead_types,
+            RouteDoc::new(
+                "Symbols with zero type uses and zero callsites — dead candidates \
+                 (?workspace=ID&path_prefix=P&kind=K)",
+            )
+            .public(),
+        )
+        .get(
+            "/ast/usage_hotspots",
+            usage_hotspots,
+            RouteDoc::new("Top-N types by type_use_count desc (?workspace=ID&path_prefix=P&top=N)").public(),
+        )
+        .get(
+            "/ast/orphans",
+            orphans,
+            RouteDoc::new(
+                "Strict dead types: zero type uses, zero callsites, no meaningful type_use_edges \
+                 row (?workspace=ID&path_prefix=P&kind=K&exclude_pub_use=bool)",
+            )
+            .public(),
+        )
+        .get(
+            "/ast/role_groups",
+            role_groups,
+            RouteDoc::new(
+                "Group types by shared name tokens, optionally merged under synonym canonicals \
+                 (?workspace=ID&path_prefix=P&token=T&min_size=N&kind=K&use_synonyms=bool)",
+            )
+            .public(),
+        )
+        .get(
+            "/ast/find_twins",
+            find_twins,
+            RouteDoc::new(
+                "Find types similar to a seed by shape, shared/synonym tokens, or size; \
+                 also implementors when the seed is a trait (?seed=NAME&workspace=ID&path_prefix=P)",
+            )
+            .public(),
+        )
+        .get(
+            "/ast/workspace_summary",
+            workspace_summary,
+            RouteDoc::new(
+                "High-level workspace report: totals, dead counts, hotspots, duplicate clusters, \
+                 role groups, potential savings (?workspace=ID&path_prefix=P)",
+            )
+            .public(),
+        )
+        .get(
+            "/ast/cleanup_plan",
+            cleanup_plan,
+            RouteDoc::new(
+                "Prioritised cleanup action list — duplicate collapse, dead subsystem removal, \
+                 synonym consolidation (?workspace=ID&path_prefix=P&limit=N)",
+            )
+            .public(),
+        )
 }
 
 // ---------------------------------------------------------------------------

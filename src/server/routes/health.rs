@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{extract::State, Json};
+use nemo_service::router::{DocRouter, RouteDoc};
 use serde::Serialize;
 
 use crate::server::state::SharedState;
@@ -13,10 +14,23 @@ use crate::HealthStatus;
 /// operation (e.g. `/index`) holds the DB lock.
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 
-pub fn router() -> Router<SharedState> {
-    Router::new()
-        .route("/health", get(get_health))
-        .route("/ready", get(get_ready))
+pub fn router() -> DocRouter<SharedState> {
+    DocRouter::new()
+        .get(
+            "/health",
+            get_health,
+            RouteDoc::new(
+                "Liveness probe — cached DB stats, never queries the database. \
+                 d-watchdog health-checks this with a 45s timeout because a cold \
+                 restart's first refresh scans a multi-GB index.",
+            )
+            .public(),
+        )
+        .get(
+            "/ready",
+            get_ready,
+            RouteDoc::new("Readiness probe — bounded SELECT 1; 503 if the DB is locked/unreachable").public(),
+        )
 }
 
 /// Pure liveness probe. Never queries the database and never blocks on a

@@ -3,9 +3,11 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use dig2memory::db::schema::init_schema;
 use dig2memory::server::config::Config;
+use dig2memory::server::registration;
 use dig2memory::server::state::{AppState, SharedState};
 use dig2memory::server::stats::{spawn_stats_refresher, StatsCache};
 use dig2memory::server::routes;
+use nemo_service::register;
 
 #[tokio::main]
 async fn main() {
@@ -30,11 +32,21 @@ async fn main() {
 
     spawn_stats_refresher(state.clone());
 
-    let app = routes::api_router(state);
+    let (router, endpoints) = routes::build_router();
+    let app = router.with_state(state);
 
     let addr = format!("127.0.0.1:{}", config.port);
     tracing::info!("dig2memory-server listening on {}", addr);
 
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
+
+    // Self-registration (`nemo-service/CLAUDE.md`'s contract: this can
+    // never fail or delay startup) -- fire-and-forget, once the socket is
+    // live.
+    let _reassert = register::spawn(
+        registration::service_manifest(endpoints, config.port),
+        register::DEFAULT_REASSERT_INTERVAL,
+    );
+
     axum::serve(listener, app).await.expect("server error");
 }

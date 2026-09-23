@@ -1,8 +1,8 @@
 use axum::{
     extract::{Query, State},
-    routing::get,
-    Json, Router,
+    Json,
 };
+use nemo_service::router::{DocRouter, RouteDoc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -11,18 +11,62 @@ use crate::search::trigram::fuzzy_search;
 use crate::server::state::{with_db, AppError, SharedState};
 use crate::types::Symbol;
 
-pub fn router() -> Router<SharedState> {
-    Router::new()
-        .route("/ast/search", get(search_symbols))
-        .route("/ast/symbols", get(symbols_in_file))
-        .route("/ast/callers", get(callers_of_symbol))
-        .route("/ast/deps", get(file_deps))
-        .route("/ast/duplicates", get(duplicates_of_name))
-        .route("/ast/all_duplicates", get(all_duplicates))
-        .route("/ast/semantic_duplicates", get(semantic_duplicates))
-        .route("/ast/impls", get(impls_of_trait))
-        .route("/ast/inherent_impls", get(inherent_impls_of_type))
-        .route("/ast/impl_summary", get(impl_summary))
+pub fn router() -> DocRouter<SharedState> {
+    DocRouter::new()
+        .get("/ast/search", search_symbols, RouteDoc::new("Fuzzy symbol search by name (?q=NAME)").public())
+        .get(
+            "/ast/symbols",
+            symbols_in_file,
+            RouteDoc::new("List all symbols in a file (?file=PATH&workspace=WS)").public(),
+        )
+        .get(
+            "/ast/callers",
+            callers_of_symbol,
+            RouteDoc::new("Find callers of a symbol (?sym=NAME&workspace=WS)").public(),
+        )
+        .get("/ast/deps", file_deps, RouteDoc::new("File dependency list (?file=PATH&workspace=WS)").public())
+        .get(
+            "/ast/duplicates",
+            duplicates_of_name,
+            RouteDoc::new(
+                "List all definitions of a name, classified exact/structural/name-only \
+                 (?name=NAME&workspace=ID&kind=KIND)",
+            )
+            .public(),
+        )
+        .get(
+            "/ast/all_duplicates",
+            all_duplicates,
+            RouteDoc::new("All symbols with 2+ definitions, ranked by count (?workspace=ID&min_count=N&kind=KIND)")
+                .public(),
+        )
+        .get(
+            "/ast/semantic_duplicates",
+            semantic_duplicates,
+            RouteDoc::new(
+                "Type-shape duplicates: same struct fields/enum variants/trait methods under \
+                 different names (?workspace=ID&path_prefix=P&kind=K&loose=bool&min_names=N&\
+                 min_locations=N&min_fields=N&max_fields=N)",
+            )
+            .public(),
+        )
+        .get(
+            "/ast/impls",
+            impls_of_trait,
+            RouteDoc::new("All types implementing a trait (?trait=NAME&workspace=ID&path_prefix=P)").public(),
+        )
+        .get(
+            "/ast/inherent_impls",
+            inherent_impls_of_type,
+            RouteDoc::new("Inherent impl blocks for a type, no trait (?type=NAME&workspace=ID&path_prefix=P)")
+                .public(),
+        )
+        .get(
+            "/ast/impl_summary",
+            impl_summary,
+            RouteDoc::new("All traits with their implementors, sorted by implementor count desc (?workspace=ID&path_prefix=P)")
+                .public(),
+        )
 }
 
 #[derive(Deserialize)]

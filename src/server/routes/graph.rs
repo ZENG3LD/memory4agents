@@ -1,20 +1,32 @@
 use axum::{
     extract::{Query, State},
-    routing::get,
-    Json, Router,
+    Json,
 };
+use nemo_service::router::{DocRouter, RouteDoc};
 use serde::Deserialize;
 use std::collections::{HashSet, VecDeque};
 use crate::db::reader;
 use crate::server::state::{with_db, AppError, SharedState};
 
-pub fn router() -> Router<SharedState> {
-    Router::new()
-        .route("/graph/crates", get(list_crates))
-        .route("/graph/files", get(files_in_crate))
-        .route("/graph/impact", get(impact_analysis))
-        .route("/graph/hotspots", get(hotspots))
-        .route("/graph/resolve", get(resolve_symbol))
+pub fn router() -> DocRouter<SharedState> {
+    DocRouter::new()
+        .get("/graph/crates", list_crates, RouteDoc::new("Crate dependency tree (?workspace=WS)").public())
+        .get(
+            "/graph/files",
+            files_in_crate,
+            RouteDoc::new("File-level dependency edges within a crate (?crate=NAME&workspace=WS)").public(),
+        )
+        .get(
+            "/graph/impact",
+            impact_analysis,
+            RouteDoc::new("Impact analysis — what breaks if this file changes (?file=PATH&workspace=WS)").public(),
+        )
+        .get("/graph/hotspots", hotspots, RouteDoc::new("Most-connected modules (?workspace=WS)").public())
+        .get(
+            "/graph/resolve",
+            resolve_symbol,
+            RouteDoc::new("Resolve which crate owns a symbol (?sym=NAME&workspace=WS)").public(),
+        )
 }
 
 #[derive(Deserialize)]
