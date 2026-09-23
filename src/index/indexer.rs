@@ -12,6 +12,26 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+/// What triggered an [`Indexer::run`] call and how much of the workspace it
+/// should touch.
+enum IndexScope {
+    /// Full workspace walk — [`IndexRequest::force`] controls whether
+    /// existing data is wiped first. Used by `POST /index`.
+    Full,
+    /// Only these specific paths changed (absolute or already relative to
+    /// the workspace root) — used by [`Indexer::run_changed_paths`]
+    /// (`crate::watch`'s debounced driver). Skips the full-workspace disk
+    /// walk and the workspace-wide mtime-diff read entirely: the caller
+    /// already knows exactly what changed, so there is nothing to diff
+    /// against. A path that no longer exists on disk has its stored rows
+    /// deleted directly (see [`writer::delete_specific_files`]) rather than
+    /// via a full stale-file scan. The crate-graph phase only runs if at
+    /// least one of these paths is a `Cargo.toml` — `req.force` is ignored
+    /// in this scope (a targeted incremental pass never wipes workspace
+    /// data).
+    Paths(Vec<PathBuf>),
+}
+
 /// Incremental workspace indexer supporting multiple languages.
 ///
 /// Reads go through [`DbPool`] (no contention with any other route); writes
@@ -20,10 +40,20 @@ use walkdir::WalkDir;
 /// losing the rest of the batch. `barrier_async` marks the points where a
 /// later phase needs everything before it durably committed — see the
 /// per-phase comments below.
+///
+/// Neither `run` nor `run_changed_paths` serializes itself against a
+/// concurrent call for the SAME workspace id — that is
+/// [`crate::index::lock::IndexLocks`]'s job. Every call site (`POST
+/// /index`, `crate::watch`'s driver) holds an `IndexLocks` guard for the
+/// full duration of its call, so at most one run per workspace is ever in
+/// flight; without that, two concurrent runs' phases could interleave
+/// (e.g. one run's force-wipe landing between another run's per-file
+/// upserts) even though the `BatchWriter` itself only ever serializes
+/// individual ops, not whole runs.
 pub struct Indexer;
 
 impl Indexer {
-    /// Run an incremental index pass for the given request. Blocking work
+    /// Run a full-workspace index pass for the given request. Blocking work
     /// (filesystem walk, tree-sitter parsing, `cargo metadata`) always runs
     /// inside `spawn_blocking`; this function itself never blocks a tokio
     /// worker thread.
@@ -31,6 +61,28 @@ impl Indexer {
         reader_pool: &DbPool,
         writer_handle: &BatchWriter,
         req: &IndexRequest,
+    ) -> Result<IndexResult, CoreError> {
+        Self::run_scoped(reader_pool, writer_handle, req, IndexScope::Full).await
+    }
+
+    /// Indexes only `changed_paths` instead of walking the whole workspace
+    /// — used by `crate::watch`'s debounced driver so a small edit doesn't
+    /// pay for a full ~24k-file disk walk or a `cargo metadata` subprocess
+    /// per submodule. See [`IndexScope::Paths`] for the exact semantics.
+    pub async fn run_changed_paths(
+        reader_pool: &DbPool,
+        writer_handle: &BatchWriter,
+        req: &IndexRequest,
+        changed_paths: Vec<PathBuf>,
+    ) -> Result<IndexResult, CoreError> {
+        Self::run_scoped(reader_pool, writer_handle, req, IndexScope::Paths(changed_paths)).await
+    }
+
+    async fn run_scoped(
+        reader_pool: &DbPool,
+        writer_handle: &BatchWriter,
+        req: &IndexRequest,
+        scope: IndexScope,
     ) -> Result<IndexResult, CoreError> {
         let start = std::time::Instant::now();
         let root = PathBuf::from(&req.root_path);
@@ -47,59 +99,88 @@ impl Indexer {
             writer_handle.send(Box::new(move |conn| writer::upsert_workspace(conn, &ws)));
         }
 
-        // Phase 2: collect all supported source files — filesystem walk,
-        // no DB involved, run off the async task.
-        let all_files = {
-            let root = root.clone();
-            tokio::task::spawn_blocking(move || collect_source_files(&root)).await?
-        };
-        let files_scanned = all_files.len() as u32;
-        tracing::info!("found {} source files in {:?}", files_scanned, root);
+        // Phases 2+3: collect the candidate files for this run and filter
+        // to the ones that actually need (re)indexing. `IndexScope::Full`
+        // walks the whole workspace and diffs against stored mtimes (or
+        // wipes everything first under `force`); `IndexScope::Paths` skips
+        // both the walk and the diff — the caller already knows exactly
+        // what changed.
+        let (files_scanned, files_to_index): (u32, Vec<(PathBuf, String, i64, i64)>) = match &scope
+        {
+            IndexScope::Full => {
+                let all_files = {
+                    let root = root.clone();
+                    tokio::task::spawn_blocking(move || collect_source_files(&root)).await?
+                };
+                let files_scanned = all_files.len() as u32;
+                tracing::info!("found {} source files in {:?}", files_scanned, root);
 
-        // Phase 3: filter to files that need (re)indexing.
-        let files_to_index: Vec<(PathBuf, String, i64, i64)> = if req.force {
-            // Force: wipe existing workspace data first. Must land before
-            // any Phase 4 write lands, so barrier both sides of the wipe.
-            writer_handle.barrier_async().await;
-            let wid = workspace_id.clone();
-            writer_handle.send(Box::new(move |conn| {
-                conn.execute(
-                    "DELETE FROM type_use_edges WHERE workspace_id = ?1",
-                    rusqlite::params![wid],
-                )?;
-                conn.execute("DELETE FROM symbols WHERE workspace_id = ?1", rusqlite::params![wid])?;
-                conn.execute("DELETE FROM call_edges WHERE workspace_id = ?1", rusqlite::params![wid])?;
-                conn.execute("DELETE FROM file_edges WHERE workspace_id = ?1", rusqlite::params![wid])?;
-                conn.execute(
-                    "DELETE FROM file_records WHERE workspace_id = ?1",
-                    rusqlite::params![wid],
-                )?;
-                Ok(())
-            }));
-            writer_handle.barrier_async().await;
-            all_files
-        } else {
-            // Incremental: one read for every stored mtime in this
-            // workspace, then filter in-process — no per-file round trip.
-            let wid = workspace_id.clone();
-            let stored_mtimes: HashMap<String, i64> = reader_pool
-                .read(move |conn| {
-                    let mut stmt = conn.prepare(
-                        "SELECT file_path, mtime FROM file_records WHERE workspace_id = ?1",
-                    )?;
-                    let rows = stmt
-                        .query_map(rusqlite::params![wid], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                        })?
-                        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
-                    Ok(rows)
+                let to_index = if req.force {
+                    // Force: wipe existing workspace data first. Must land
+                    // before any Phase 4 write lands, so barrier both sides
+                    // of the wipe.
+                    writer_handle.barrier_async().await;
+                    let wid = workspace_id.clone();
+                    writer_handle.send(Box::new(move |conn| {
+                        conn.execute(
+                            "DELETE FROM type_use_edges WHERE workspace_id = ?1",
+                            rusqlite::params![wid],
+                        )?;
+                        conn.execute("DELETE FROM symbols WHERE workspace_id = ?1", rusqlite::params![wid])?;
+                        conn.execute("DELETE FROM call_edges WHERE workspace_id = ?1", rusqlite::params![wid])?;
+                        conn.execute("DELETE FROM file_edges WHERE workspace_id = ?1", rusqlite::params![wid])?;
+                        conn.execute(
+                            "DELETE FROM file_records WHERE workspace_id = ?1",
+                            rusqlite::params![wid],
+                        )?;
+                        Ok(())
+                    }));
+                    writer_handle.barrier_async().await;
+                    all_files
+                } else {
+                    // Incremental: one read for every stored mtime in this
+                    // workspace, then filter in-process — no per-file round trip.
+                    let wid = workspace_id.clone();
+                    let stored_mtimes: HashMap<String, i64> = reader_pool
+                        .read(move |conn| {
+                            let mut stmt = conn.prepare(
+                                "SELECT file_path, mtime FROM file_records WHERE workspace_id = ?1",
+                            )?;
+                            let rows = stmt
+                                .query_map(rusqlite::params![wid], |row| {
+                                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                                })?
+                                .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+                            Ok(rows)
+                        })
+                        .await?;
+
+                    all_files
+                        .into_iter()
+                        .filter(|(_, rel, mtime, _)| stored_mtimes.get(rel) != Some(mtime))
+                        .collect()
+                };
+                (files_scanned, to_index)
+            }
+            IndexScope::Paths(paths) => {
+                // The watcher's own fs events are a strictly better "this
+                // changed" signal than a stored-mtime diff (which loses to
+                // mtime-resolution races), so every given path that still
+                // exists is indexed unconditionally — no DB read needed to
+                // decide.
+                let root_for_stat = root.clone();
+                let paths_owned = paths.clone();
+                let candidates = tokio::task::spawn_blocking(move || {
+                    stat_candidate_files(&root_for_stat, &paths_owned)
                 })
                 .await?;
-
-            all_files
-                .into_iter()
-                .filter(|(_, rel, mtime, _)| stored_mtimes.get(rel) != Some(mtime))
-                .collect()
+                tracing::info!(
+                    "watch-triggered pass: {} changed path(s), {} indexable",
+                    paths.len(),
+                    candidates.len()
+                );
+                (paths.len() as u32, candidates)
+            }
         };
 
         tracing::info!("{} files need indexing", files_to_index.len());
@@ -134,20 +215,47 @@ impl Indexer {
             tracing::info!("enqueued: {} files indexed so far", files_indexed);
         }
 
-        // Phase 5: remove stale files — must see every Phase 4 write first,
-        // and diffs against a fresh disk walk (not the Phase 2 snapshot).
+        // Phase 5: remove stale files — must see every Phase 4 write first.
+        // `IndexScope::Full` diffs against a fresh disk walk (not the Phase
+        // 2 snapshot); `IndexScope::Paths` only checks the given paths
+        // themselves — no full re-walk — and deletes rows for exactly the
+        // ones no longer on disk.
         writer_handle.barrier_async().await;
-        {
-            let root_for_walk = root.clone();
-            let current_files: HashSet<String> = tokio::task::spawn_blocking(move || {
-                collect_source_files(&root_for_walk)
-                    .into_iter()
-                    .map(|(_, rel, _, _)| rel)
-                    .collect()
-            })
-            .await?;
-            let wid = workspace_id.clone();
-            writer_handle.send(Box::new(move |conn| writer::delete_stale_files(conn, &wid, &current_files)));
+        match &scope {
+            IndexScope::Full => {
+                let root_for_walk = root.clone();
+                let current_files: HashSet<String> = tokio::task::spawn_blocking(move || {
+                    collect_source_files(&root_for_walk)
+                        .into_iter()
+                        .map(|(_, rel, _, _)| rel)
+                        .collect()
+                })
+                .await?;
+                let wid = workspace_id.clone();
+                writer_handle.send(Box::new(move |conn| writer::delete_stale_files(conn, &wid, &current_files)));
+            }
+            IndexScope::Paths(paths) => {
+                let root_for_check = root.clone();
+                let paths_owned = paths.clone();
+                let vanished: HashSet<String> = tokio::task::spawn_blocking(move || {
+                    paths_owned
+                        .iter()
+                        .filter_map(|p| {
+                            let abs = if p.is_absolute() { p.clone() } else { root_for_check.join(p) };
+                            if abs.is_file() {
+                                None
+                            } else {
+                                Some(to_relative(&root_for_check, &abs))
+                            }
+                        })
+                        .collect()
+                })
+                .await?;
+                if !vanished.is_empty() {
+                    let wid = workspace_id.clone();
+                    writer_handle.send(Box::new(move |conn| writer::delete_specific_files(conn, &wid, &vanished)));
+                }
+            }
         }
 
         // Phase 6: crate graph — discovers every submodule-rooted
@@ -157,7 +265,19 @@ impl Indexer {
         // Stale nodes/edges (e.g. a submodule removed from disk, or the
         // recon's 7 dead rows from a long-gone root manifest) are pruned
         // via replace-all-for-workspace semantics before the upsert loop.
-        {
+        // `IndexScope::Paths` skips this entirely unless one of the
+        // changed paths is itself a `Cargo.toml` — a single edited `.rs`
+        // file never needs a `cargo metadata` subprocess per submodule.
+        let run_crate_graph_phase = match &scope {
+            IndexScope::Full => true,
+            IndexScope::Paths(paths) => paths
+                .iter()
+                .any(|p| p.file_name().map(|f| f == "Cargo.toml").unwrap_or(false)),
+        };
+        if !run_crate_graph_phase {
+            tracing::debug!("skipping crate-graph phase — no Cargo.toml among changed paths");
+        }
+        if run_crate_graph_phase {
             let root_for_graph = root.clone();
             let wid = workspace_id.clone();
             let graph_result =
@@ -461,20 +581,61 @@ fn collect_source_files(root: &Path) -> Vec<(PathBuf, String, i64, i64)> {
 
         let mtime = file_mtime(&meta);
         let size = meta.len() as i64;
-
-        // Normalise to forward slashes for cross-platform consistency.
-        let abs_str = path.to_string_lossy().replace('\\', "/");
-        let root_str = root.to_string_lossy().replace('\\', "/");
-        let rel = if abs_str.starts_with(&root_str) {
-            abs_str[root_str.len()..].trim_start_matches('/').to_string()
-        } else {
-            abs_str.clone()
-        };
+        let rel = to_relative(root, path);
 
         result.push((path.to_path_buf(), rel, mtime, size));
     }
 
     result
+}
+
+/// Stats exactly the given `paths` (used by [`IndexScope::Paths`] instead
+/// of a full workspace walk) and returns `(abs_path, rel_path, mtime,
+/// size)` for each one that currently exists as a plain file with a
+/// supported source extension. `paths` may be absolute (as filesystem
+/// watcher events are) or already relative to `root`. Duplicates (the same
+/// relative path reached via more than one input entry) are collapsed.
+fn stat_candidate_files(root: &Path, paths: &[PathBuf]) -> Vec<(PathBuf, String, i64, i64)> {
+    let mut result = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for p in paths {
+        let abs = if p.is_absolute() { p.clone() } else { root.join(p) };
+        let ext = match abs.extension().and_then(|e| e.to_str()) {
+            Some(e) => e,
+            None => continue,
+        };
+        if !registry::is_supported_extension(ext) {
+            continue;
+        }
+        let meta = match abs.metadata() {
+            Ok(m) if m.is_file() => m,
+            _ => continue, // vanished, or not a plain file — handled by Phase 5 instead
+        };
+
+        let rel = to_relative(root, &abs);
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        let mtime = file_mtime(&meta);
+        let size = meta.len() as i64;
+        result.push((abs, rel, mtime, size));
+    }
+
+    result
+}
+
+/// Shared relative-path normalisation [`collect_source_files`] and
+/// [`stat_candidate_files`] both need — forward slashes, `root` prefix
+/// stripped, no leading slash.
+fn to_relative(root: &Path, abs: &Path) -> String {
+    let abs_str = abs.to_string_lossy().replace('\\', "/");
+    let root_str = root.to_string_lossy().replace('\\', "/");
+    if let Some(stripped) = abs_str.strip_prefix(&root_str) {
+        stripped.trim_start_matches('/').to_string()
+    } else {
+        abs_str
+    }
 }
 
 /// Returns `true` if a WalkDir entry should be skipped entirely.
@@ -520,8 +681,11 @@ fn file_mtime(meta: &std::fs::Metadata) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::lock::IndexLocks;
     use crate::storage::{BatchConfig, Db, DbConfig, MigrationRunner};
     use std::io::Write as _;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
 
     async fn test_writer_and_pool(tag: &str) -> (Db, BatchWriter, DbPool, PathBuf) {
         let mut path = std::env::temp_dir();
@@ -553,6 +717,22 @@ mod tests {
         let mut f = std::fs::File::create(&path).expect("create source file");
         f.write_all(contents.as_bytes()).expect("write source file");
         path
+    }
+
+    /// Writes a minimal standalone crate one level under `root` (mirroring
+    /// `graph::crates`'s own fixture shape: a submodule-rooted manifest,
+    /// not a manifest at `root` itself — `parse_multi_manifest_workspace`
+    /// only discovers `Cargo.toml` one level deep).
+    fn write_fixture_crate(root: &Path, subdir: &str, name: &str) {
+        let crate_dir = root.join(subdir);
+        std::fs::create_dir_all(crate_dir.join("src")).expect("create crate src dir");
+        std::fs::write(crate_dir.join("src/lib.rs"), b"pub fn marker() {}\n")
+            .expect("write crate lib.rs");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("write crate manifest");
     }
 
     #[tokio::test]
@@ -645,5 +825,228 @@ mod tests {
         assert_eq!(resolve_caller_id(&entries, 7), 20);
         assert_eq!(resolve_caller_id(&entries, 20), 30);
         assert_eq!(resolve_caller_id(&entries, 0), 0);
+    }
+
+    /// Defect fix: a watch-triggered batch containing a single edited `.rs`
+    /// file must index exactly that file (not walk the whole workspace)
+    /// and must NOT invoke the crate-graph phase, even though a perfectly
+    /// valid `Cargo.toml` sits on disk in a sibling directory.
+    #[tokio::test]
+    async fn run_changed_paths_indexes_only_the_given_file_and_skips_crate_graph_without_a_manifest(
+    ) {
+        let (db, writer, reader_pool, db_path) =
+            test_writer_and_pool("changed-paths-no-manifest").await;
+
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "m4a-indexer-changed-paths-no-manifest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root dir");
+        write_fixture_crate(&root, "crate-a", "m4a-fixture-changed-paths-no-manifest");
+        // Must never be touched by a targeted run over a different file.
+        write_rust_file(&root, "untouched.rs", "pub fn untouched() {}\n");
+
+        let req = IndexRequest {
+            workspace_id: "ws".to_string(),
+            root_path: root.to_string_lossy().replace('\\', "/"),
+            workspace_name: "ws".to_string(),
+            force: false,
+        };
+
+        let changed = vec![root.join("crate-a").join("src").join("lib.rs")];
+        let result = Indexer::run_changed_paths(&reader_pool, &writer, &req, changed)
+            .await
+            .expect("run_changed_paths succeeds");
+        assert_eq!(result.files_indexed, 1, "must index exactly the one changed file");
+
+        let wid = "ws".to_string();
+        let mut indexed_paths: Vec<String> = reader_pool
+            .read(move |conn| {
+                conn.prepare("SELECT file_path FROM file_records WHERE workspace_id = ?1")?
+                    .query_map(rusqlite::params![wid], |r| r.get(0))?
+                    .collect()
+            })
+            .await
+            .expect("read file_records");
+        indexed_paths.sort();
+        assert_eq!(
+            indexed_paths,
+            vec!["crate-a/src/lib.rs".to_string()],
+            "untouched.rs must never be indexed by a targeted run over a different file"
+        );
+
+        let wid2 = "ws".to_string();
+        let crate_node_count: i64 = reader_pool
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM crate_nodes WHERE workspace_id = ?1",
+                    rusqlite::params![wid2],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .expect("read crate_nodes count");
+        assert_eq!(
+            crate_node_count, 0,
+            "crate-graph phase must not run without a Cargo.toml among the changed paths"
+        );
+
+        drop(writer);
+        drop(reader_pool);
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Mirror of the test above: a batch containing a `Cargo.toml` DOES
+    /// invoke the crate-graph phase.
+    #[tokio::test]
+    async fn run_changed_paths_runs_crate_graph_when_a_manifest_is_among_the_changed_paths() {
+        let (db, writer, reader_pool, db_path) = test_writer_and_pool("changed-paths-manifest").await;
+
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "m4a-indexer-changed-paths-manifest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root dir");
+        write_fixture_crate(&root, "crate-a", "m4a-fixture-changed-paths-manifest");
+
+        let req = IndexRequest {
+            workspace_id: "ws".to_string(),
+            root_path: root.to_string_lossy().replace('\\', "/"),
+            workspace_name: "ws".to_string(),
+            force: false,
+        };
+
+        let changed = vec![root.join("crate-a").join("Cargo.toml")];
+        let result = Indexer::run_changed_paths(&reader_pool, &writer, &req, changed)
+            .await
+            .expect("run_changed_paths succeeds");
+        assert_eq!(result.files_indexed, 0, "Cargo.toml itself is never a parsed source file");
+
+        let wid = "ws".to_string();
+        let crate_names: Vec<String> = reader_pool
+            .read(move |conn| {
+                conn.prepare("SELECT name FROM crate_nodes WHERE workspace_id = ?1")?
+                    .query_map(rusqlite::params![wid], |r| r.get(0))?
+                    .collect()
+            })
+            .await
+            .expect("read crate_nodes");
+        assert!(
+            crate_names.contains(&"m4a-fixture-changed-paths-manifest".to_string()),
+            "crate-graph phase must run when a Cargo.toml is among the changed paths: {crate_names:?}"
+        );
+
+        drop(writer);
+        drop(reader_pool);
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// End-to-end version of `index::lock`'s primitive test, through real
+    /// `Indexer::run` calls for the SAME workspace id — proves the fix's
+    /// actual wiring (acquire `IndexLocks` for the WHOLE `Indexer::run`
+    /// call, exactly like `POST /index` and the watcher driver do), not
+    /// just the bare mutex. Run A is held open past its own `Indexer::run`
+    /// completion via a channel (deterministic — no timing race needed to
+    /// catch a violation); run B must not even start until A releases.
+    #[tokio::test]
+    async fn concurrent_runs_for_the_same_workspace_never_interleave_under_the_shared_lock() {
+        let (db, writer, reader_pool, db_path) = test_writer_and_pool("single-flight").await;
+        let locks = IndexLocks::new();
+
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "m4a-indexer-single-flight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root dir");
+        write_rust_file(&root, "a.rs", "pub fn a() {}\n");
+
+        let req = IndexRequest {
+            workspace_id: "ws".to_string(),
+            root_path: root.to_string_lossy().replace('\\', "/"),
+            workspace_name: "ws".to_string(),
+            force: false,
+        };
+
+        let log: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        let (hold_release_tx, hold_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (a_started_tx, a_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let log_a = log.clone();
+        let locks_a = locks.clone();
+        let reader_pool_a = reader_pool.clone();
+        let writer_a = writer.clone();
+        let req_a = req.clone();
+        let task_a = tokio::spawn(async move {
+            let _guard = locks_a.acquire(&req_a.workspace_id).await;
+            log_a.lock().unwrap_or_else(|p| p.into_inner()).push("A-start");
+            let _ = a_started_tx.send(());
+            Indexer::run(&reader_pool_a, &writer_a, &req_a).await.expect("run A succeeds");
+            // Hold the guard open past completion, deterministically, so
+            // run B has every chance to (wrongly) start early.
+            let _ = hold_release_rx.await;
+            log_a.lock().unwrap_or_else(|p| p.into_inner()).push("A-end");
+        });
+        a_started_rx.await.expect("run A signals it started");
+
+        let log_b = log.clone();
+        let locks_b = locks.clone();
+        let reader_pool_b = reader_pool.clone();
+        let writer_b = writer.clone();
+        let req_b = req.clone();
+        let task_b = tokio::spawn(async move {
+            let _guard = locks_b.acquire(&req_b.workspace_id).await;
+            log_b.lock().unwrap_or_else(|p| p.into_inner()).push("B-start");
+            Indexer::run(&reader_pool_b, &writer_b, &req_b).await.expect("run B succeeds");
+            log_b.lock().unwrap_or_else(|p| p.into_inner()).push("B-end");
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let snapshot = log.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            assert_eq!(
+                snapshot,
+                vec!["A-start"],
+                "run B must not start before run A releases its lock: {snapshot:?}"
+            );
+        }
+
+        let _ = hold_release_tx.send(());
+        task_a.await.expect("run A task must not panic");
+        task_b.await.expect("run B task must not panic");
+
+        let final_log = log.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(
+            final_log,
+            vec!["A-start", "A-end", "B-start", "B-end"],
+            "runs for the same workspace must never interleave: {final_log:?}"
+        );
+
+        drop(writer);
+        drop(reader_pool);
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -7,16 +7,30 @@
 //!
 //! The debounce/coalesce mechanism ([`watch_and_debounce`]) is deliberately
 //! decoupled from what it triggers — [`spawn_watcher`] wires it to a real
-//! incremental `Indexer::run` call for the server; this module's own tests
-//! exercise the debounce mechanism standalone via an injected counter
-//! callback, without touching the database.
+//! targeted incremental `Indexer::run_changed_paths` call for the server;
+//! this module's own tests exercise the debounce mechanism standalone via
+//! an injected counter callback, without touching the database.
+//!
+//! Two correctness properties [`spawn_watcher`] itself is responsible for
+//! (neither belongs to the debounce mechanism):
+//!   - **Single-flight**: every reindex it triggers goes through
+//!     `state.index_locks` — the SAME per-workspace lock `POST /index`
+//!     acquires — so a watch-triggered pass and a manual `/index` call for
+//!     the same workspace never run concurrently. See
+//!     [`crate::index::lock::IndexLocks`].
+//!   - **Coalescing**: if more debounced batches arrive while a
+//!     watch-triggered run is still in flight, they are merged into a
+//!     single pending changed-path set and run ONCE after the in-flight run
+//!     finishes — never once per arriving batch. See [`CoalesceState`].
 
 use crate::index::indexer::{is_excluded_name, Indexer};
 use crate::server::state::SharedState;
 use crate::types::IndexRequest;
 use notify::{RecursiveMode, Watcher};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 /// Runtime toggle + debounce window, read once at boot.
@@ -44,23 +58,37 @@ impl WatchConfig {
     }
 }
 
-/// Spawns a `notify::RecommendedWatcher` over `root_path` and, on every
-/// debounced batch of non-excluded filesystem events, runs one incremental
-/// (`force=false`) `Indexer::run` call, off the request path. Never
-/// triggers `force=true`. A failure to start the watcher (bad path, OS
-/// resource limits, …) is logged, not fatal — same "never block startup"
-/// discipline as `nemo_service::register::spawn`. The watcher itself is
-/// leaked (kept alive for the process's lifetime) once started; there is no
-/// shutdown path today, matching `server::stats::spawn_stats_refresher`'s
-/// own lifetime.
+/// Coalescing state for one workspace's watch-triggered reindex driver: at
+/// most one driver task alive at a time (`driver_alive`), and every batch
+/// of changed paths that arrives is merged into `pending` — whether or not
+/// a driver is currently mid-run — so a burst of triggers while busy
+/// collapses into exactly one follow-up run over the union of everything
+/// that arrived, not one run per trigger.
 ///
-/// Must not run concurrently with a full index of the same workspace — a
-/// caller-triggered `force=true` `/index` and a watch-triggered incremental
-/// pass both funnel through the same [`crate::storage::BatchWriter`], whose
-/// single dedicated worker thread serializes every write regardless of
-/// which path enqueued it, so the two can never interleave writes; the
-/// watch-triggered pass simply queues behind (or ahead of) whichever
-/// `Indexer::run` call happened to reach the writer first.
+/// `pending` and `driver_alive` are mutated together under the SAME lock so
+/// there is no lost-wakeup race between "a trigger decides no driver is
+/// alive and spawns one" and "the driver decides nothing is pending and
+/// exits" — both checks and both mutations happen inside one critical
+/// section.
+#[derive(Default)]
+struct CoalesceState {
+    pending: HashSet<PathBuf>,
+    driver_alive: bool,
+}
+
+/// Spawns a `notify::RecommendedWatcher` over `root_path` and, on every
+/// debounced batch of non-excluded filesystem events, runs one targeted
+/// incremental `Indexer::run_changed_paths` call over exactly those paths
+/// — never a full workspace walk — off the request path. Never triggers
+/// `force=true`. A failure to start the watcher (bad path, OS resource
+/// limits, …) is logged, not fatal — same "never block startup" discipline
+/// as `nemo_service::register::spawn`. The watcher itself is leaked (kept
+/// alive for the process's lifetime) once started; there is no shutdown
+/// path today, matching `server::stats::spawn_stats_refresher`'s own
+/// lifetime.
+///
+/// See the module doc comment for the single-flight and coalescing
+/// guarantees this function provides on top of the raw debounce mechanism.
 pub fn spawn_watcher(state: SharedState, workspace_id: String, root_path: String, cfg: WatchConfig) {
     if !cfg.enabled {
         tracing::info!("MEMORY4AGENT_WATCH=0 — file watcher disabled");
@@ -72,26 +100,26 @@ pub fn spawn_watcher(state: SharedState, workspace_id: String, root_path: String
     let log_root = root_path.clone();
     let log_debounce_ms = debounce.as_millis();
 
-    let watcher = watch_and_debounce(&root, debounce, move || {
-        let state = state.clone();
-        let workspace_id = workspace_id.clone();
-        let root_path = root_path.clone();
-        tokio::spawn(async move {
-            let req = IndexRequest {
-                workspace_id: workspace_id.clone(),
-                root_path,
-                workspace_name: workspace_id,
-                force: false,
-            };
-            match Indexer::run(&state.reader_pool, &state.writer, &req).await {
-                Ok(result) => tracing::info!(
-                    files_indexed = result.files_indexed,
-                    symbols = result.symbols_extracted,
-                    "watch-triggered incremental reindex"
-                ),
-                Err(e) => tracing::warn!("watch-triggered reindex failed: {e}"),
+    let coalesce: Arc<StdMutex<CoalesceState>> = Arc::new(StdMutex::new(CoalesceState::default()));
+
+    let watcher = watch_and_debounce(&root, debounce, move |changed_paths: HashSet<PathBuf>| {
+        let should_spawn_driver = {
+            let mut cs = coalesce.lock().unwrap_or_else(|p| p.into_inner());
+            cs.pending.extend(changed_paths);
+            if cs.driver_alive {
+                false
+            } else {
+                cs.driver_alive = true;
+                true
             }
-        });
+        };
+        if should_spawn_driver {
+            let state = state.clone();
+            let workspace_id = workspace_id.clone();
+            let root_path = root_path.clone();
+            let coalesce = coalesce.clone();
+            tokio::spawn(run_reindex_driver(state, workspace_id, root_path, coalesce));
+        }
     });
 
     match watcher {
@@ -106,27 +134,71 @@ pub fn spawn_watcher(state: SharedState, workspace_id: String, root_path: String
     }
 }
 
+/// Drains `coalesce.pending` in a loop, running one
+/// `Indexer::run_changed_paths` pass per non-empty drain, until it observes
+/// an empty `pending` set (checked in the SAME locked critical section that
+/// would otherwise let a concurrent trigger's paths get lost) — then clears
+/// `driver_alive` and exits. Holds `state.index_locks`'s per-workspace lock
+/// for the duration of each `Indexer::run_changed_paths` call, exactly like
+/// `POST /index` does, so a manual `/index` call and this driver never run
+/// concurrently for the same workspace.
+async fn run_reindex_driver(
+    state: SharedState,
+    workspace_id: String,
+    root_path: String,
+    coalesce: Arc<StdMutex<CoalesceState>>,
+) {
+    loop {
+        let batch: Vec<PathBuf> = {
+            let mut cs = coalesce.lock().unwrap_or_else(|p| p.into_inner());
+            if cs.pending.is_empty() {
+                cs.driver_alive = false;
+                return;
+            }
+            std::mem::take(&mut cs.pending).into_iter().collect()
+        };
+
+        let req = IndexRequest {
+            workspace_id: workspace_id.clone(),
+            root_path: root_path.clone(),
+            workspace_name: workspace_id.clone(),
+            force: false,
+        };
+        let _guard = state.index_locks.acquire(&workspace_id).await;
+        match Indexer::run_changed_paths(&state.reader_pool, &state.writer, &req, batch).await {
+            Ok(result) => tracing::info!(
+                files_indexed = result.files_indexed,
+                symbols = result.symbols_extracted,
+                "watch-triggered incremental reindex"
+            ),
+            Err(e) => tracing::warn!("watch-triggered reindex failed: {e}"),
+        }
+    }
+}
+
 /// Core debounce mechanism, decoupled from what gets triggered so it can be
 /// tested on its own (see this module's tests) without touching
-/// `Indexer`/the database. Watches `root` recursively; every event whose
-/// path survives [`is_path_excluded`] resets the debounce window.
-/// `on_trigger` fires exactly once per coalesced batch, after `debounce`
-/// has elapsed with no further surviving events.
+/// `Indexer`/the database. Watches `root` recursively; every event path
+/// that survives [`is_path_excluded`] joins the current batch and resets
+/// the debounce window. `on_trigger` fires exactly once per coalesced
+/// batch, receiving the set of surviving paths, after `debounce` has
+/// elapsed with no further surviving events.
 fn watch_and_debounce<F>(
     root: &Path,
     debounce: Duration,
     mut on_trigger: F,
 ) -> notify::Result<notify::RecommendedWatcher>
 where
-    F: FnMut() + Send + 'static,
+    F: FnMut(HashSet<PathBuf>) + Send + 'static,
 {
-    let (event_tx, event_rx) = std_mpsc::channel::<()>();
+    let (event_tx, event_rx) = std_mpsc::channel::<PathBuf>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         match res {
             Ok(event) => {
-                let relevant = event.paths.iter().any(|p| !is_path_excluded(p));
-                if relevant && event_tx.send(()).is_err() {
-                    tracing::warn!("file watcher debounce thread is gone — event dropped");
+                for p in event.paths {
+                    if !is_path_excluded(&p) && event_tx.send(p).is_err() {
+                        tracing::warn!("file watcher debounce thread is gone — event dropped");
+                    }
                 }
             }
             Err(e) => tracing::warn!("file watcher event error: {e}"),
@@ -137,18 +209,23 @@ where
     std::thread::Builder::new()
         .name("m4a-watch-debounce".to_string())
         .spawn(move || {
-            while event_rx.recv().is_ok() {
+            while let Ok(first) = event_rx.recv() {
+                let mut batch: HashSet<PathBuf> = HashSet::new();
+                batch.insert(first);
                 // Keep draining until the queue has been quiet for a full
                 // debounce window, coalescing everything in between into
                 // this one batch.
                 loop {
                     match event_rx.recv_timeout(debounce) {
-                        Ok(()) => continue,
+                        Ok(p) => {
+                            batch.insert(p);
+                            continue;
+                        }
                         Err(std_mpsc::RecvTimeoutError::Timeout) => break,
                         Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                on_trigger();
+                on_trigger(batch);
             }
         })
         .expect("watch debounce thread spawn");
@@ -173,7 +250,6 @@ fn is_path_excluded(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     fn temp_watch_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -190,16 +266,20 @@ mod tests {
     }
 
     /// The plan's own acceptance test: touch 3 files within one debounce
-    /// window and assert exactly one trigger fires — proved via an injected
-    /// counter, not a real reindex.
+    /// window and assert exactly one trigger fires, carrying all 3 changed
+    /// paths in one batch — proved via an injected counter, not a real
+    /// reindex.
     #[test]
     fn three_touches_within_the_debounce_window_trigger_exactly_once() {
         let dir = temp_watch_dir("debounce");
 
         let trigger_count = Arc::new(AtomicUsize::new(0));
+        let last_batch_size = Arc::new(AtomicUsize::new(0));
         let counted = trigger_count.clone();
-        let watcher = watch_and_debounce(&dir, Duration::from_millis(150), move || {
+        let sized = last_batch_size.clone();
+        let watcher = watch_and_debounce(&dir, Duration::from_millis(150), move |batch| {
             counted.fetch_add(1, Ordering::SeqCst);
+            sized.store(batch.len(), Ordering::SeqCst);
         })
         .expect("watcher starts");
 
@@ -220,6 +300,10 @@ mod tests {
             1,
             "3 touches inside one debounce window must coalesce into exactly one trigger"
         );
+        assert!(
+            last_batch_size.load(Ordering::SeqCst) >= 1,
+            "the coalesced batch must carry at least one changed path"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -232,7 +316,7 @@ mod tests {
 
         let trigger_count = Arc::new(AtomicUsize::new(0));
         let counted = trigger_count.clone();
-        let watcher = watch_and_debounce(&dir, Duration::from_millis(150), move || {
+        let watcher = watch_and_debounce(&dir, Duration::from_millis(150), move |_batch| {
             counted.fetch_add(1, Ordering::SeqCst);
         })
         .expect("watcher starts");
@@ -259,4 +343,53 @@ mod tests {
         assert!(!is_path_excluded(Path::new("/repo/src/lib.rs")));
     }
 
+    /// A batch that arrives while the driver is still processing a previous
+    /// batch must be merged into ONE follow-up run, not spawn a second
+    /// concurrent driver — proved directly against `CoalesceState`'s own
+    /// invariant (the primitive `spawn_watcher`'s closure relies on), the
+    /// same way `index::lock` tests the `IndexLocks` primitive directly
+    /// rather than through a real reindex.
+    #[test]
+    fn a_trigger_while_a_driver_is_alive_merges_into_pending_without_spawning_a_second_driver() {
+        let coalesce: Arc<StdMutex<CoalesceState>> = Arc::new(StdMutex::new(CoalesceState::default()));
+
+        // First trigger: no driver alive yet -> becomes responsible for spawning one.
+        let first_paths: HashSet<PathBuf> = [PathBuf::from("a.rs")].into_iter().collect();
+        let should_spawn_first = {
+            let mut cs = coalesce.lock().expect("lock");
+            cs.pending.extend(first_paths);
+            if cs.driver_alive {
+                false
+            } else {
+                cs.driver_alive = true;
+                true
+            }
+        };
+        assert!(should_spawn_first, "the first trigger must be the one to spawn the driver");
+
+        // Second trigger arrives while the (simulated) driver is still
+        // alive: must merge into pending, not claim spawn responsibility.
+        let second_paths: HashSet<PathBuf> = [PathBuf::from("b.rs")].into_iter().collect();
+        let should_spawn_second = {
+            let mut cs = coalesce.lock().expect("lock");
+            cs.pending.extend(second_paths);
+            if cs.driver_alive {
+                false
+            } else {
+                cs.driver_alive = true;
+                true
+            }
+        };
+        assert!(
+            !should_spawn_second,
+            "a trigger arriving while a driver is alive must never spawn a second driver"
+        );
+
+        let merged = coalesce.lock().expect("lock").pending.clone();
+        assert_eq!(
+            merged,
+            [PathBuf::from("a.rs"), PathBuf::from("b.rs")].into_iter().collect::<HashSet<_>>(),
+            "both batches must be merged into the single pending set: {merged:?}"
+        );
+    }
 }

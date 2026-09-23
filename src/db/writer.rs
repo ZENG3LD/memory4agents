@@ -331,3 +331,24 @@ pub fn delete_stale_files(
     Ok(())
 }
 
+/// Delete file records (and cascade-delete their symbols) for exactly the
+/// given `paths` — used by [`crate::index::indexer::Indexer::run_changed_paths`]
+/// (the watcher's targeted incremental pass) when it has already determined
+/// via a direct filesystem check that these specific paths no longer exist,
+/// rather than diffing a full disk walk against every stored file the way
+/// [`delete_stale_files`] does. Unconditional per given path — deleting a
+/// path with no matching row is simply a no-op.
+pub fn delete_specific_files(
+    conn: &Connection,
+    workspace_id: &str,
+    paths: &HashSet<String>,
+) -> rusqlite::Result<()> {
+    for path in paths {
+        conn.execute(
+            "DELETE FROM file_records WHERE workspace_id = ?1 AND file_path = ?2",
+            params![workspace_id, path],
+        )?;
+    }
+    Ok(())
+}
+

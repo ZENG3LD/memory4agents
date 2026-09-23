@@ -265,6 +265,7 @@ async fn resolve_symbol(
 mod tests {
     use super::*;
     use crate::db::writer;
+    use crate::index::lock::IndexLocks;
     use crate::server::state::AppState;
     use crate::server::stats::StatsCache;
     use crate::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool, MigrationRunner};
@@ -393,6 +394,7 @@ mod tests {
             reader_pool,
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+            index_locks: IndexLocks::new(),
         });
         (state, path)
     }

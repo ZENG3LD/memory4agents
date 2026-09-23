@@ -97,6 +97,7 @@ async fn ready_probe(state: &SharedState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::lock::IndexLocks;
     use crate::server::state::{with_db, AppError, AppState};
     use crate::server::stats::StatsCache;
     use crate::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool};
@@ -112,6 +113,7 @@ mod tests {
             reader_pool,
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+            index_locks: IndexLocks::new(),
         })
     }
 

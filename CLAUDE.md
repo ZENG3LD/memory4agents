@@ -174,22 +174,70 @@ instead of accumulating dead rows forever.
 ## File watcher (piece 0.9)
 
 `crate::watch::spawn_watcher`, wired from `bin/server.rs` right after the
-stats refresher, watches a workspace root and runs one incremental
-(`force=false`) `Indexer::run` per debounced batch of filesystem events —
-off the request path, through the same `reader_pool`/`writer` every other
-caller uses. Filtered through the same exclusion list `index::indexer`'s
-own workspace walk uses (target/node_modules/.cargo/.git/build/hidden
-dirs), checked against every ancestor path component of each event (a
-watcher gets one full path per event, unlike a `WalkDir` traversal that
-simply never descends into an excluded directory). There is no single "the
-workspace" this server owns by default, so the watcher only starts when a
-root path is explicitly configured:
+stats refresher, watches a workspace root and runs one targeted incremental
+`Indexer::run_changed_paths` call per debounced batch of filesystem events
+— off the request path, through the same `reader_pool`/`writer` every other
+caller uses, over exactly the paths that changed rather than a full
+workspace walk (see "Changed-paths indexing" below). Filtered through the
+same exclusion list `index::indexer`'s own workspace walk uses
+(target/node_modules/.cargo/.git/build/hidden dirs), checked against every
+ancestor path component of each event (a watcher gets one full path per
+event, unlike a `WalkDir` traversal that simply never descends into an
+excluded directory). There is no single "the workspace" this server owns by
+default, so the watcher only starts when a root path is explicitly
+configured:
 
 - `MEMORY4AGENT_WATCH_ROOT_PATH` — unset by default; the watcher does not
   start at all until this is set.
 - `MEMORY4AGENT_WATCH_WORKSPACE_ID` (default `nemo` once a root path is set).
 - `MEMORY4AGENT_WATCH` (default `1`; `0` disables even when a root path is set).
 - `MEMORY4AGENT_WATCH_DEBOUNCE_MS` (default `2000`).
+
+If a debounced batch arrives while a watch-triggered run is still in
+flight, it is never dropped and never spawns a second concurrent run — its
+changed paths are merged into the one pending set the in-flight run's
+driver will pick up and run once, immediately after, as a single follow-up
+pass (`watch::CoalesceState`).
+
+## Single-flight indexing (per workspace)
+
+`BatchWriter` serializes individual write *ops* (one `SAVEPOINT` per op,
+one transaction per flushed batch) — it does NOT order two whole
+multi-phase `Indexer::run` calls against each other. Two concurrent runs
+for the SAME workspace could otherwise interleave phases (e.g. a
+`force=true` run's wipe landing between another run's per-file upserts).
+`crate::index::lock::IndexLocks`, held in `AppState::index_locks`, closes
+that gap: one `tokio::sync::Mutex<()>` per workspace id, acquired for the
+FULL duration of a run. Both call sites hold it end-to-end:
+
+- `POST /index` (`server/routes/index.rs`) acquires the lock, then calls
+  `Indexer::run` — chosen behaviour when the lock is already held: **wait**,
+  not a "409 index in progress" rejection (a caller-invoked `/index` wants
+  the freshest index, not a poll).
+- `crate::watch`'s debounced driver (`watch::run_reindex_driver`) acquires
+  the SAME lock before each `Indexer::run_changed_paths` call.
+
+Different workspace ids never contend with each other. Covered by
+`cargo test -p memory4agent --release --lib index::lock::` (the primitive,
+proven via deterministic channel-signaled hold/release, not timing) and
+`--lib index::indexer::concurrent_runs_for_the_same_workspace_never_interleave_under_the_shared_lock`
+(the same guarantee through real `Indexer::run` calls).
+
+## Changed-paths indexing (`Indexer::run_changed_paths`)
+
+`Indexer::run` (full workspace walk, used by `POST /index`) is unchanged.
+`Indexer::run_changed_paths(reader_pool, writer, req, changed_paths)` is a
+second entry point — used only by the watcher — that skips the
+~24k-file workspace walk and the workspace-wide stored-mtime diff entirely:
+the caller already knows exactly what changed (a real filesystem event is a
+strictly better signal than an mtime comparison), so every given path that
+still exists is (re)indexed unconditionally, and a path that no longer
+exists on disk has its stored rows deleted directly
+(`db::writer::delete_specific_files`) instead of via a full stale-file
+scan. The crate-graph phase (a `cargo metadata` subprocess per submodule)
+only runs if at least one changed path is itself named `Cargo.toml` — a
+single edited `.rs` file never triggers it. `req.force` is ignored in this
+mode; a targeted incremental pass never wipes workspace data.
 
 ## impl_trait tracking (v0.2.10+)
 

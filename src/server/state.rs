@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 use axum::response::{IntoResponse, Response};
 use axum::http::StatusCode;
+use crate::index::lock::IndexLocks;
 use crate::server::stats::StatsCache;
 use crate::storage::{BatchWriter, DbPool};
 use crate::CoreError;
@@ -18,6 +19,11 @@ pub struct AppState {
     /// Last known DB stats for `/health`, refreshed by a background task.
     /// See [`crate::server::stats::spawn_stats_refresher`].
     pub stats_cache: Arc<RwLock<StatsCache>>,
+    /// Per-workspace single-flight lock, shared by the `/index` route
+    /// handler and `crate::watch`'s debounced driver — at most one
+    /// `Indexer::run`/`run_changed_paths` call per workspace id at a time.
+    /// See [`crate::index::lock::IndexLocks`].
+    pub index_locks: IndexLocks,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -116,6 +122,7 @@ mod tests {
             reader_pool,
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+            index_locks: IndexLocks::new(),
         });
 
         // Kick off a deliberately slow read on the pool (simulates a heavy

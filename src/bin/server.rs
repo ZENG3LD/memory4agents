@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
+use memory4agent::index::lock::IndexLocks;
 use memory4agent::server::config::Config;
 use memory4agent::server::registration;
 use memory4agent::server::state::{AppState, SharedState};
@@ -50,6 +51,7 @@ async fn main() {
         reader_pool,
         data_dir: config.data_dir,
         stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+        index_locks: IndexLocks::new(),
     });
 
     spawn_stats_refresher(state.clone());
