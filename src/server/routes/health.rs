@@ -3,7 +3,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{extract::State, Json};
-use nemo_service::router::{DocRouter, RouteDoc};
+use mcp_service4agent::router::{DocRouter, RouteDoc};
 use serde::Serialize;
 
 use crate::server::state::SharedState;

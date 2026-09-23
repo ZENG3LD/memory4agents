@@ -1,7 +1,7 @@
 //! `POST /mcp` — the MCP (Model Context Protocol) door onto the SAME
 //! `/ast/*`, `/graph/*`, `/ast/*` (usage/dead-code family) and `/index`
 //! surface the plain HTTP routes serve, built on the shared
-//! `nemo_service::mcp::McpServer` (`nemo-service`, feature `mcp`) instead of
+//! `mcp_service4agent::mcp::McpServer` (crate `mcp-service4agent`) instead of
 //! a hand-written JSON-RPC implementation — see
 //! `docs/memory4agent/plans/2026-09-23-memory4agent-plan.md`, phase 1.
 //! Every tool below dispatches into the exact `*_impl` function its HTTP
@@ -44,7 +44,7 @@ use serde_json::{json, Value};
 
 use crate::server::state::SharedState;
 use crate::IndexRequest;
-use nemo_service::mcp::{McpServer, Tool, ToolOutcome};
+use mcp_service4agent::mcp::{McpServer, Tool, ToolOutcome};
 
 use super::ast;
 use super::graph;
@@ -581,7 +581,7 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use axum::Router;
-    use nemo_service::mcp::Budget;
+    use mcp_service4agent::mcp::Budget;
     use std::sync::{Arc, RwLock};
     use tower::ServiceExt;
 

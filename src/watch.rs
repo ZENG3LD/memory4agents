@@ -82,7 +82,7 @@ struct CoalesceState {
 /// — never a full workspace walk — off the request path. Never triggers
 /// `force=true`. A failure to start the watcher (bad path, OS resource
 /// limits, …) is logged, not fatal — same "never block startup" discipline
-/// as `nemo_service::register::spawn`. The watcher itself is leaked (kept
+/// as `mcp_service4agent::register::spawn`. The watcher itself is leaked (kept
 /// alive for the process's lifetime) once started; there is no shutdown
 /// path today, matching `server::stats::spawn_stats_refresher`'s own
 /// lifetime.

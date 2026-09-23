@@ -14,6 +14,9 @@ lang-rust = []
 lang-typescript = ["dep:tree-sitter-typescript"]
 lang-python = ["dep:tree-sitter-python"]
 lang-go = ["dep:tree-sitter-go"]
+# Self-registration with the local process supervisor (d-watchdog). Off by
+# default; the deployed service is built with `--features nemo`.
+nemo = ["mcp-service4agent/nemo"]
 
 [[bin]]
 name = "memory4agent-server"
@@ -46,16 +49,14 @@ axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# d-watchdog registry client: `router::DocRouter` builds the route table and
-# records its own endpoint list; `register::spawn` pushes that list as this
-# service's self-asserted manifest (see `src/server/registration.rs`).
-nemo-service = { path = "../nemo-service", default-features = false, features = ["axum", "client", "mcp"] }
+# MCP server + DocRouter (route self-description). Self-registration with a
+# local process supervisor is behind this crate's own `nemo` feature.
+mcp-service4agent = { version = "0.1.0", path = "../mcp-service4agent" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 # `Router::oneshot` for driving the MCP route (`server::routes::mcp`) in
-# tests without a real listener — same dev-only use `nemo-service` and
-# `mail4agent` already make of this crate.
+# tests without a real listener.
 tower = { version = "0.5", default-features = false, features = ["util"] }

@@ -3,13 +3,15 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use memory4agent::index::lock::IndexLocks;
 use memory4agent::server::config::Config;
+#[cfg(feature = "nemo")]
 use memory4agent::server::registration;
 use memory4agent::server::state::{AppState, SharedState};
 use memory4agent::server::stats::{spawn_stats_refresher, StatsCache};
 use memory4agent::server::routes;
 use memory4agent::storage::migrations::{legacy_schema_migrations, seed_legacy_versions_if_needed};
 use memory4agent::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool, MigrationRunner};
-use nemo_service::register;
+#[cfg(feature = "nemo")]
+use mcp_service4agent::register;
 
 #[tokio::main]
 async fn main() {
@@ -83,13 +85,15 @@ async fn main() {
 
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
 
-    // Self-registration (`nemo-service/CLAUDE.md`'s contract: this can
-    // never fail or delay startup) -- fire-and-forget, once the socket is
-    // live.
+    // Self-registration with the local process supervisor (feature `nemo`):
+    // never fails or delays startup; fire-and-forget once the socket is live.
+    #[cfg(feature = "nemo")]
     let _reassert = register::spawn(
         registration::service_manifest(endpoints, config.port),
         register::DEFAULT_REASSERT_INTERVAL,
     );
+    #[cfg(not(feature = "nemo"))]
+    drop(endpoints);
 
     axum::serve(listener, app).await.expect("server error");
 }

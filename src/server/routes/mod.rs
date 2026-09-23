@@ -1,5 +1,5 @@
 use axum::Router;
-use nemo_service::manifest::Endpoint;
+use mcp_service4agent::router::Endpoint;
 use crate::server::state::SharedState;
 
 mod ast;
@@ -10,8 +10,8 @@ mod mcp;
 mod usage;
 
 /// Builds the full HTTP route table plus the [`Endpoint`] list recorded
-/// while doing so, via `nemo_service::router::DocRouter` — the same list
-/// `bin/server.rs` hands to `nemo_service::register::spawn` (through
+/// while doing so, via `mcp_service4agent::router::DocRouter` — the same list
+/// `bin/server.rs` hands to `mcp_service4agent::register::spawn` (feature `nemo`, through
 /// `crate::server::registration::service_manifest`) to describe this
 /// service truthfully. There is exactly one place a route is described:
 /// here, at the same call that wires it into the real router.

@@ -1,22 +1,15 @@
-//! Builds the `nemo_service::manifest::ServiceManifest` memory4agent-server
-//! asserts about itself via `PUT /registry/memory4agent-server` (see
-//! `bin/server.rs`'s call to `nemo_service::register::spawn`). `endpoints`
-//! is the list `crate::server::routes::build_router` recorded while
-//! building the real router via `nemo_service::router::DocRouter` — there
-//! is exactly one place a route is described. Replaces the hand-written
-//! `.nemo-service.toml`, deleted in the same commit as this module.
-//!
-//! The old `dig2memory-server` registry entry this replaces is orphaned by
-//! the rename (a new manifest name, not an update to the old one) and is
-//! removed via the watchdog API separately — see
-//! `.claude/rules/d-watchdog-service-update.md` and plan piece 0.1.
+//! Builds the manifest memory4agent-server asserts about itself to a local
+//! process supervisor via `PUT /registry/memory4agent-server` (cargo feature
+//! `nemo`; see `bin/server.rs`'s call to `mcp_service4agent::register::spawn`).
+//! `endpoints` is the list `crate::server::routes::build_router` recorded
+//! while building the real router via `mcp_service4agent::router::DocRouter`
+//! — there is exactly one place a route is described.
 
-use nemo_service::manifest::{
-    Dependencies, Endpoint, HealthInfo, Links, ManageAction, ParamSpec, ServiceManifest, ServiceMeta,
+use mcp_service4agent::manifest::{
+    Dependencies, HealthInfo, Links, ManageAction, ParamSpec, ServiceManifest, ServiceMeta,
 };
+use mcp_service4agent::router::Endpoint as RouteEndpoint;
 
-/// `memory4agent/CLAUDE.md`'s own one-line description, carried over from
-/// the retired `.nemo-service.toml` (originally written for dig2memory).
 const SERVICE_DESCRIPTION: &str = "AST index + dependency graph + fuzzy search server for coding agents (port 18200)";
 
 /// Build the manifest memory4agent-server asserts about itself. `endpoints`
@@ -31,7 +24,10 @@ const SERVICE_DESCRIPTION: &str = "AST index + dependency graph + fuzzy search s
 /// unauthenticated (`auth = "none"`, see each router's `RouteDoc`) — there
 /// is no bearer, session, or API key to name. `memory4agent-server` relies
 /// entirely on binding to `127.0.0.1` for its access control.
-pub fn service_manifest(endpoints: Vec<Endpoint>, port: u16) -> ServiceManifest {
+pub fn service_manifest(endpoints: Vec<RouteEndpoint>, port: u16) -> ServiceManifest {
+    // The reindex action targets the root the watcher is configured for;
+    // no machine path is baked into the source.
+    let index_root = std::env::var("MEMORY4AGENT_WATCH_ROOT_PATH").unwrap_or_default();
     ServiceManifest {
         service: ServiceMeta {
             name: "memory4agent-server".to_string(),
@@ -48,7 +44,7 @@ pub fn service_manifest(endpoints: Vec<Endpoint>, port: u16) -> ServiceManifest 
             docs: Some("memory4agent/README.md".to_string()),
             repo: Some("memory4agent".to_string()),
         },
-        endpoints,
+        endpoints: endpoints.into_iter().map(Into::into).collect(),
         manage_actions: vec![
             ManageAction {
                 id: "reindex".to_string(),
@@ -61,8 +57,13 @@ pub fn service_manifest(endpoints: Vec<Endpoint>, port: u16) -> ServiceManifest 
                 confirm: false,
                 icon: None,
                 body: Some(
-                    r#"{"workspace_id":"nemo","workspace_name":"nemo","root_path":"c:/src/nemo","force":false}"#
-                        .to_string(),
+                    serde_json::json!({
+                        "workspace_id": "nemo",
+                        "workspace_name": "nemo",
+                        "root_path": index_root,
+                        "force": false,
+                    })
+                    .to_string(),
                 ),
                 content_type: Some("application/json".to_string()),
                 timeout_secs: Some(600),
