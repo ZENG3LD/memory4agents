@@ -1,7 +1,7 @@
 use crate::ast::{registry, symbols as sym_extractor};
 use crate::db::writer;
 use crate::error::CoreError;
-use crate::graph::crates::parse_cargo_workspace;
+use crate::graph::crates::parse_multi_manifest_workspace;
 use crate::storage::{BatchWriter, DbPool};
 use crate::types::{
     CallEdge, FileRecord, IndexRequest, IndexResult, PendingTypeUse, Symbol, SymbolKind,
@@ -150,16 +150,30 @@ impl Indexer {
             writer_handle.send(Box::new(move |conn| writer::delete_stale_files(conn, &wid, &current_files)));
         }
 
-        // Phase 6: crate graph — `cargo metadata` subprocess, no DB, run via
-        // spawn_blocking directly (not through the pool).
+        // Phase 6: crate graph — discovers every submodule-rooted
+        // `Cargo.toml` one level under `root` (piece 0.7; `nemo` itself has
+        // no root manifest), one `cargo metadata` subprocess per manifest,
+        // no DB, run via spawn_blocking directly (not through the pool).
+        // Stale nodes/edges (e.g. a submodule removed from disk, or the
+        // recon's 7 dead rows from a long-gone root manifest) are pruned
+        // via replace-all-for-workspace semantics before the upsert loop.
         {
             let root_for_graph = root.clone();
             let wid = workspace_id.clone();
             let graph_result =
-                tokio::task::spawn_blocking(move || parse_cargo_workspace(&root_for_graph, &wid)).await?;
+                tokio::task::spawn_blocking(move || parse_multi_manifest_workspace(&root_for_graph, &wid)).await?;
             match graph_result {
                 Ok((nodes, edges)) => {
+                    let current_names: HashSet<String> =
+                        nodes.iter().map(|n| n.name.clone()).collect();
+                    let current_edges: HashSet<(String, String)> = edges
+                        .iter()
+                        .map(|e| (e.from_crate.clone(), e.to_crate.clone()))
+                        .collect();
+                    let wid = workspace_id.clone();
                     writer_handle.send(Box::new(move |conn| {
+                        writer::delete_stale_crate_nodes(conn, &wid, &current_names)?;
+                        writer::delete_stale_crate_dep_edges(conn, &wid, &current_edges)?;
                         for node in &nodes {
                             if let Err(e) = writer::upsert_crate_node(conn, node) {
                                 tracing::warn!("crate node insert error: {e}");
@@ -468,11 +482,23 @@ fn is_not_excluded(entry: &walkdir::DirEntry) -> bool {
     !is_excluded(entry)
 }
 
-fn is_excluded(entry: &walkdir::DirEntry) -> bool {
+/// `pub(crate)` so `graph::crates::parse_multi_manifest_workspace` (piece
+/// 0.7, one-level-deep submodule discovery) and `crate::watch` (piece 0.9,
+/// filesystem-event filtering) share this exact same predicate rather than
+/// each keeping their own copy of the excluded-name list.
+pub(crate) fn is_excluded(entry: &walkdir::DirEntry) -> bool {
     let name = entry.file_name().to_str().unwrap_or("");
+    is_excluded_name(name, entry.file_type().is_dir())
+}
 
+/// The name-only half of [`is_excluded`], usable against a plain path
+/// component (no `walkdir::DirEntry` available) — `crate::watch` checks
+/// every ancestor component of a raw filesystem-event path against this,
+/// since (unlike a `WalkDir` traversal that simply never descends into
+/// `target/`) a watcher gets one full path per event regardless of depth.
+pub(crate) fn is_excluded_name(name: &str, is_dir: bool) -> bool {
     // Skip any hidden directory (starts with '.').
-    if name.starts_with('.') && entry.file_type().is_dir() {
+    if name.starts_with('.') && is_dir {
         return true;
     }
 

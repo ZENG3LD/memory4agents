@@ -241,6 +241,71 @@ pub fn upsert_crate_dep_edge(conn: &Connection, edge: &DepEdge) -> rusqlite::Res
     Ok(())
 }
 
+/// Delete crate nodes for a workspace whose name is no longer present in a
+/// freshly parsed [`crate::graph::crates::parse_multi_manifest_workspace`]
+/// result — replace-all-for-workspace semantics, same shape as
+/// [`delete_stale_files`] below. This is what makes a crate removed from
+/// disk (or the recon's 7 dead rows from a long-gone root manifest)
+/// actually disappear on the next `/index`, instead of accumulating forever
+/// under upsert-only semantics.
+pub fn delete_stale_crate_nodes(
+    conn: &Connection,
+    workspace_id: &str,
+    current_names: &HashSet<String>,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("SELECT name FROM crate_nodes WHERE workspace_id = ?1")?;
+    let stored: Vec<String> = stmt
+        .query_map(params![workspace_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for name in stored {
+        if !current_names.contains(&name) {
+            conn.execute(
+                "DELETE FROM crate_nodes WHERE workspace_id = ?1 AND name = ?2",
+                params![workspace_id, name],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete crate dependency edges for a workspace whose exact `(from_crate,
+/// to_crate)` pair is no longer present in a freshly parsed
+/// [`crate::graph::crates::parse_multi_manifest_workspace`] result.
+///
+/// Compares the full edge identity, not just crate-name membership: an
+/// edge's `to_crate` is very often an external registry dependency (e.g.
+/// `tokio`) that never appears in `crate_nodes` at all, so pruning by
+/// `to_crate` name membership alone would wrongly delete every edge to a
+/// non-workspace-member dependency. A stored edge survives as long as the
+/// current parse still reports that exact dependency; it is deleted only
+/// when it genuinely no longer exists (the source crate was removed, or it
+/// dropped that dependency).
+pub fn delete_stale_crate_dep_edges(
+    conn: &Connection,
+    workspace_id: &str,
+    current_edges: &HashSet<(String, String)>,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT from_crate, to_crate FROM crate_dep_edges WHERE workspace_id = ?1",
+    )?;
+    let stored: Vec<(String, String)> = stmt
+        .query_map(params![workspace_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (from_crate, to_crate) in stored {
+        if !current_edges.contains(&(from_crate.clone(), to_crate.clone())) {
+            conn.execute(
+                "DELETE FROM crate_dep_edges WHERE workspace_id = ?1 AND from_crate = ?2 AND to_crate = ?3",
+                params![workspace_id, from_crate, to_crate],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Delete file records (and cascade-delete their symbols) for files no longer on disk.
 pub fn delete_stale_files(
     conn: &Connection,
