@@ -14,7 +14,6 @@ lang-rust = []
 lang-typescript = ["dep:tree-sitter-typescript"]
 lang-python = ["dep:tree-sitter-python"]
 lang-go = ["dep:tree-sitter-go"]
-watcher = ["dep:notify"]
 
 [[bin]]
 name = "memory4agent-server"
@@ -40,7 +39,7 @@ hex = "0.4"
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
-notify = { version = "6", optional = true }
+notify = "6"
 
 # Server
 axum = { version = "0.8", features = ["json"] }

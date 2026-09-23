@@ -1,0 +1,262 @@
+//! Debounced filesystem watcher → incremental reindex (piece 0.9). Fixes
+//! the recon's "no watcher / no incremental reindex" defect and retires the
+//! dead `watcher` Cargo feature (`notify` was an optional dependency never
+//! referenced anywhere in `src/`) — `notify` is now a plain dependency; the
+//! on/off switch is the runtime env var [`WatchConfig::from_env`] reads,
+//! not a compile-time feature.
+//!
+//! The debounce/coalesce mechanism ([`watch_and_debounce`]) is deliberately
+//! decoupled from what it triggers — [`spawn_watcher`] wires it to a real
+//! incremental `Indexer::run` call for the server; this module's own tests
+//! exercise the debounce mechanism standalone via an injected counter
+//! callback, without touching the database.
+
+use crate::index::indexer::{is_excluded_name, Indexer};
+use crate::server::state::SharedState;
+use crate::types::IndexRequest;
+use notify::{RecursiveMode, Watcher};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
+
+/// Runtime toggle + debounce window, read once at boot.
+#[derive(Debug, Clone, Copy)]
+pub struct WatchConfig {
+    pub enabled: bool,
+    pub debounce: Duration,
+}
+
+impl WatchConfig {
+    /// `MEMORY4AGENT_WATCH` (default "1" — enabled; any value other than
+    /// `"0"` also enables), `MEMORY4AGENT_WATCH_DEBOUNCE_MS` (default 2000).
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("MEMORY4AGENT_WATCH")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let debounce_ms = std::env::var("MEMORY4AGENT_WATCH_DEBOUNCE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2000);
+        Self {
+            enabled,
+            debounce: Duration::from_millis(debounce_ms),
+        }
+    }
+}
+
+/// Spawns a `notify::RecommendedWatcher` over `root_path` and, on every
+/// debounced batch of non-excluded filesystem events, runs one incremental
+/// (`force=false`) `Indexer::run` call, off the request path. Never
+/// triggers `force=true`. A failure to start the watcher (bad path, OS
+/// resource limits, …) is logged, not fatal — same "never block startup"
+/// discipline as `nemo_service::register::spawn`. The watcher itself is
+/// leaked (kept alive for the process's lifetime) once started; there is no
+/// shutdown path today, matching `server::stats::spawn_stats_refresher`'s
+/// own lifetime.
+///
+/// Must not run concurrently with a full index of the same workspace — a
+/// caller-triggered `force=true` `/index` and a watch-triggered incremental
+/// pass both funnel through the same [`crate::storage::BatchWriter`], whose
+/// single dedicated worker thread serializes every write regardless of
+/// which path enqueued it, so the two can never interleave writes; the
+/// watch-triggered pass simply queues behind (or ahead of) whichever
+/// `Indexer::run` call happened to reach the writer first.
+pub fn spawn_watcher(state: SharedState, workspace_id: String, root_path: String, cfg: WatchConfig) {
+    if !cfg.enabled {
+        tracing::info!("MEMORY4AGENT_WATCH=0 — file watcher disabled");
+        return;
+    }
+
+    let root = PathBuf::from(&root_path);
+    let debounce = cfg.debounce;
+    let log_root = root_path.clone();
+    let log_debounce_ms = debounce.as_millis();
+
+    let watcher = watch_and_debounce(&root, debounce, move || {
+        let state = state.clone();
+        let workspace_id = workspace_id.clone();
+        let root_path = root_path.clone();
+        tokio::spawn(async move {
+            let req = IndexRequest {
+                workspace_id: workspace_id.clone(),
+                root_path,
+                workspace_name: workspace_id,
+                force: false,
+            };
+            match Indexer::run(&state.reader_pool, &state.writer, &req).await {
+                Ok(result) => tracing::info!(
+                    files_indexed = result.files_indexed,
+                    symbols = result.symbols_extracted,
+                    "watch-triggered incremental reindex"
+                ),
+                Err(e) => tracing::warn!("watch-triggered reindex failed: {e}"),
+            }
+        });
+    });
+
+    match watcher {
+        Ok(w) => {
+            // No shutdown path today — keep it alive for the process's
+            // lifetime, same discipline as `spawn_stats_refresher`'s
+            // detached background task.
+            Box::leak(Box::new(w));
+            tracing::info!(root = %log_root, debounce_ms = log_debounce_ms, "file watcher started");
+        }
+        Err(e) => tracing::warn!(root = %log_root, "failed to start file watcher: {e}"),
+    }
+}
+
+/// Core debounce mechanism, decoupled from what gets triggered so it can be
+/// tested on its own (see this module's tests) without touching
+/// `Indexer`/the database. Watches `root` recursively; every event whose
+/// path survives [`is_path_excluded`] resets the debounce window.
+/// `on_trigger` fires exactly once per coalesced batch, after `debounce`
+/// has elapsed with no further surviving events.
+fn watch_and_debounce<F>(
+    root: &Path,
+    debounce: Duration,
+    mut on_trigger: F,
+) -> notify::Result<notify::RecommendedWatcher>
+where
+    F: FnMut() + Send + 'static,
+{
+    let (event_tx, event_rx) = std_mpsc::channel::<()>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        match res {
+            Ok(event) => {
+                let relevant = event.paths.iter().any(|p| !is_path_excluded(p));
+                if relevant && event_tx.send(()).is_err() {
+                    tracing::warn!("file watcher debounce thread is gone — event dropped");
+                }
+            }
+            Err(e) => tracing::warn!("file watcher event error: {e}"),
+        }
+    })?;
+    watcher.watch(root, RecursiveMode::Recursive)?;
+
+    std::thread::Builder::new()
+        .name("m4a-watch-debounce".to_string())
+        .spawn(move || {
+            while event_rx.recv().is_ok() {
+                // Keep draining until the queue has been quiet for a full
+                // debounce window, coalescing everything in between into
+                // this one batch.
+                loop {
+                    match event_rx.recv_timeout(debounce) {
+                        Ok(()) => continue,
+                        Err(std_mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                on_trigger();
+            }
+        })
+        .expect("watch debounce thread spawn");
+
+    Ok(watcher)
+}
+
+/// Same exclusion list [`is_excluded_name`] applies during a workspace
+/// walk, checked against every ancestor component of a raw filesystem-event
+/// path. Unlike a `WalkDir` traversal — which simply never descends into
+/// `target/` in the first place — a watcher receives one full path per
+/// event regardless of depth, so every component needs the check, not just
+/// the final one.
+fn is_path_excluded(path: &Path) -> bool {
+    path.components().any(|c| {
+        let name = c.as_os_str().to_string_lossy();
+        is_excluded_name(&name, true)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn temp_watch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "m4a-watch-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp watch dir");
+        dir
+    }
+
+    /// The plan's own acceptance test: touch 3 files within one debounce
+    /// window and assert exactly one trigger fires — proved via an injected
+    /// counter, not a real reindex.
+    #[test]
+    fn three_touches_within_the_debounce_window_trigger_exactly_once() {
+        let dir = temp_watch_dir("debounce");
+
+        let trigger_count = Arc::new(AtomicUsize::new(0));
+        let counted = trigger_count.clone();
+        let watcher = watch_and_debounce(&dir, Duration::from_millis(150), move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect("watcher starts");
+
+        // Let the OS-level watch actually attach before touching files.
+        std::thread::sleep(Duration::from_millis(150));
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(dir.join(name), b"pub fn f() {}\n").expect("write watched file");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Wait past the debounce window (plus slack) for the single
+        // coalesced batch to fire.
+        std::thread::sleep(Duration::from_millis(600));
+        drop(watcher);
+
+        assert_eq!(
+            trigger_count.load(Ordering::SeqCst),
+            1,
+            "3 touches inside one debounce window must coalesce into exactly one trigger"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changes_under_an_excluded_directory_never_trigger() {
+        let dir = temp_watch_dir("excluded");
+        let target_dir = dir.join("target");
+        std::fs::create_dir_all(&target_dir).expect("create target subdir");
+
+        let trigger_count = Arc::new(AtomicUsize::new(0));
+        let counted = trigger_count.clone();
+        let watcher = watch_and_debounce(&dir, Duration::from_millis(150), move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect("watcher starts");
+
+        std::thread::sleep(Duration::from_millis(150));
+        std::fs::write(target_dir.join("build_output.d"), b"noise").expect("write excluded file");
+        std::thread::sleep(Duration::from_millis(600));
+        drop(watcher);
+
+        assert_eq!(
+            trigger_count.load(Ordering::SeqCst),
+            0,
+            "a change under target/ must never trigger a reindex"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_path_excluded_matches_the_shared_exclusion_list() {
+        assert!(is_path_excluded(Path::new("/repo/target/debug/foo")));
+        assert!(is_path_excluded(Path::new("/repo/.git/HEAD")));
+        assert!(is_path_excluded(Path::new("/repo/node_modules/x/index.js")));
+        assert!(!is_path_excluded(Path::new("/repo/src/lib.rs")));
+    }
+
+}

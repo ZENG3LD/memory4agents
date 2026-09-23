@@ -54,6 +54,24 @@ async fn main() {
 
     spawn_stats_refresher(state.clone());
 
+    // File watcher (piece 0.9): debounced incremental reindex. There is no
+    // single "the workspace" this server owns by default — every /index
+    // caller supplies its own workspace_id/root_path — so the watcher only
+    // starts when a root path is explicitly configured.
+    match std::env::var("MEMORY4AGENT_WATCH_ROOT_PATH") {
+        Ok(watch_root) => {
+            let watch_workspace_id = std::env::var("MEMORY4AGENT_WATCH_WORKSPACE_ID")
+                .unwrap_or_else(|_| "nemo".to_string());
+            memory4agent::watch::spawn_watcher(
+                state.clone(),
+                watch_workspace_id,
+                watch_root,
+                memory4agent::watch::WatchConfig::from_env(),
+            );
+        }
+        Err(_) => tracing::info!("MEMORY4AGENT_WATCH_ROOT_PATH unset — file watcher not started"),
+    }
+
     let (router, endpoints) = routes::build_router();
     let app = router.with_state(state);
 

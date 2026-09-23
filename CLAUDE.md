@@ -131,7 +131,8 @@ curl -X POST "http://127.0.0.1:18200/index" \
 | `/ast/callers?sym=NAME&workspace=nemo` | Who calls this symbol |
 | `/ast/deps?file=PATH&workspace=nemo` | File dependencies |
 | `/graph/crates?workspace=nemo` | Crate dependency tree |
-| `/graph/impact?file=PATH&workspace=nemo` | What breaks if this file changes |
+| `/graph/impact?file=PATH&workspace=nemo` | What breaks if this file changes (file-level, BFS over `file_edges`) |
+| `/graph/impact_symbol?sym=NAME&workspace=nemo&depth=N` | Symbol-level impact: BFS over callers via `call_edges`, N hops (default 2, max 4). Name-based until SCIP (phase 2) — two same-named symbols in the same workspace/file are only disambiguated when `call_edges.caller_symbol_id` is resolved; the callee side always matches by bare name. |
 | `/graph/hotspots?workspace=nemo` | Most-connected modules |
 | `/graph/resolve?sym=NAME&workspace=nemo` | Which crate owns this symbol |
 | `/ast/duplicates?name=NAME` | List all definitions of NAME, classified by exact/structural/name-only |
@@ -156,6 +157,39 @@ curl -X POST "http://127.0.0.1:18200/index" \
 | `/ready` | Readiness probe — runs a bounded (3s) `SELECT 1` via `spawn_blocking`; `503` if the DB is currently unreachable/locked rather than hanging. |
 
 `POST /index` triggers indexing (see "Re-index" above).
+
+## Crate graph (multi-manifest, piece 0.7)
+
+`graph::crates::parse_multi_manifest_workspace` (used by `/index`'s Phase 6,
+and by `/graph/crates`'s underlying `crate_nodes`/`crate_dep_edges` tables)
+discovers every submodule-rooted `Cargo.toml` one level under the indexed
+root and runs `cargo metadata --no-deps` per manifest — `nemo` itself has no
+root `Cargo.toml`, so there is no single-manifest shortcut. Every reindex
+prunes crate nodes/edges no longer present in the fresh parse
+(`db::writer::delete_stale_crate_nodes`/`delete_stale_crate_dep_edges`) —
+replace-all-for-workspace semantics, not upsert-only, so a submodule removed
+from disk actually disappears from `/graph/crates` on the next `/index`
+instead of accumulating dead rows forever.
+
+## File watcher (piece 0.9)
+
+`crate::watch::spawn_watcher`, wired from `bin/server.rs` right after the
+stats refresher, watches a workspace root and runs one incremental
+(`force=false`) `Indexer::run` per debounced batch of filesystem events —
+off the request path, through the same `reader_pool`/`writer` every other
+caller uses. Filtered through the same exclusion list `index::indexer`'s
+own workspace walk uses (target/node_modules/.cargo/.git/build/hidden
+dirs), checked against every ancestor path component of each event (a
+watcher gets one full path per event, unlike a `WalkDir` traversal that
+simply never descends into an excluded directory). There is no single "the
+workspace" this server owns by default, so the watcher only starts when a
+root path is explicitly configured:
+
+- `MEMORY4AGENT_WATCH_ROOT_PATH` — unset by default; the watcher does not
+  start at all until this is set.
+- `MEMORY4AGENT_WATCH_WORKSPACE_ID` (default `nemo` once a root path is set).
+- `MEMORY4AGENT_WATCH` (default `1`; `0` disables even when a root path is set).
+- `MEMORY4AGENT_WATCH_DEBOUNCE_MS` (default `2000`).
 
 ## impl_trait tracking (v0.2.10+)
 

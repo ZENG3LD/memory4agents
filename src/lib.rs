@@ -7,6 +7,7 @@ pub mod search;
 pub mod server;
 pub mod storage;
 pub mod types;
+pub mod watch;
 
 pub use error::CoreError;
 pub use types::*;
