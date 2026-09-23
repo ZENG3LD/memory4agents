@@ -628,11 +628,24 @@ fn stat_candidate_files(root: &Path, paths: &[PathBuf]) -> Vec<(PathBuf, String,
 /// Shared relative-path normalisation [`collect_source_files`] and
 /// [`stat_candidate_files`] both need — forward slashes, `root` prefix
 /// stripped, no leading slash.
+///
+/// On Windows the prefix match ignores ASCII case: the same file reaches
+/// here as `C:\…` from a filesystem event and as `c:/…` from a stored
+/// workspace root, and a case-sensitive strip would store the absolute path
+/// as a second row for the same file.
 fn to_relative(root: &Path, abs: &Path) -> String {
     let abs_str = abs.to_string_lossy().replace('\\', "/");
     let root_str = root.to_string_lossy().replace('\\', "/");
-    if let Some(stripped) = abs_str.strip_prefix(&root_str) {
-        stripped.trim_start_matches('/').to_string()
+    let n = root_str.len();
+    let has_root = abs_str.is_char_boundary(n)
+        && abs_str.len() >= n
+        && if cfg!(windows) {
+            abs_str[..n].eq_ignore_ascii_case(&root_str)
+        } else {
+            abs_str[..n] == root_str
+        };
+    if has_root {
+        abs_str[n..].trim_start_matches('/').to_string()
     } else {
         abs_str
     }
@@ -681,6 +694,21 @@ fn file_mtime(meta: &std::fs::Metadata) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn to_relative_ignores_drive_letter_case_on_windows() {
+        let root = Path::new("c:/Users/me/nemo");
+        let event = Path::new(r"C:\Users\me\nemo\uzor\src\lib.rs");
+        assert_eq!(to_relative(root, event), "uzor/src/lib.rs");
+    }
+
+    #[test]
+    fn to_relative_keeps_paths_outside_the_root_absolute() {
+        let root = Path::new("/srv/nemo");
+        assert_eq!(to_relative(root, Path::new("/srv/other/a.rs")), "/srv/other/a.rs");
+        assert_eq!(to_relative(root, Path::new("/srv/nemo/a.rs")), "a.rs");
+    }
     use crate::index::lock::IndexLocks;
     use crate::storage::{BatchConfig, Db, DbConfig, MigrationRunner};
     use std::io::Write as _;
