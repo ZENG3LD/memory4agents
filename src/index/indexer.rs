@@ -9,8 +9,56 @@ use crate::types::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
+
+/// Shared, thread-safe accumulator of every `call_edges.callee_name` /
+/// `type_use_edges.to_symbol_id` this run's writes touched — new edges from
+/// Phase 4's parsed files, plus whatever [`writer::delete_file_symbols`] /
+/// [`writer::delete_stale_files`] / [`writer::delete_specific_files`]
+/// report as removed. Drives Phase 7's scoped recompute
+/// (`writer::update_callsite_counts_for_names` /
+/// `writer::update_type_use_counts_for_symbols`) so an incremental run only
+/// touches the names/symbols this run's changes could actually affect
+/// instead of the whole workspace.
+///
+/// `std::sync::Mutex`, not `tokio::sync::Mutex`: every access happens
+/// inside a `BatchWriter` `WriteOp` closure, which runs on the writer's own
+/// plain worker thread — never inside an `.await`.
+#[derive(Clone, Default)]
+struct TouchedRefs(Arc<Mutex<(HashSet<String>, HashSet<i64>)>>);
+
+impl TouchedRefs {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn add_callee_name(&self, name: &str) {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        guard.0.insert(name.to_string());
+    }
+
+    fn add_type_use_to_id(&self, id: i64) {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        guard.1.insert(id);
+    }
+
+    fn merge_removed(&self, removed: writer::RemovedFileRefs) {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        guard.0.extend(removed.callee_names);
+        guard.1.extend(removed.type_use_to_ids);
+    }
+
+    /// Drains and returns the accumulated sets. Only meaningful once every
+    /// write this run enqueued has been confirmed committed (a
+    /// `BatchWriter::barrier_async` after every `WriteOp` that might touch
+    /// this collector) — called exactly once, right before Phase 7.
+    fn take(&self) -> (HashSet<String>, HashSet<i64>) {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        (std::mem::take(&mut guard.0), std::mem::take(&mut guard.1))
+    }
+}
 
 /// What triggered an [`Indexer::run`] call and how much of the workspace it
 /// should touch.
@@ -87,6 +135,7 @@ impl Indexer {
         let start = std::time::Instant::now();
         let root = PathBuf::from(&req.root_path);
         let workspace_id = req.workspace_id.clone();
+        let touched = TouchedRefs::new();
 
         // Phase 1: register/upsert the workspace.
         {
@@ -210,7 +259,8 @@ impl Indexer {
                 total_symbols += pf.symbols.len() as u32;
                 files_indexed += 1;
                 let wid = workspace_id.clone();
-                writer_handle.send(Box::new(move |conn| write_one_file(conn, &wid, &pf)));
+                let touched_for_op = touched.clone();
+                writer_handle.send(Box::new(move |conn| write_one_file(conn, &wid, &pf, &touched_for_op)));
             }
 
             tracing::info!("enqueued: {} files indexed so far", files_indexed);
@@ -245,7 +295,12 @@ impl Indexer {
                 })
                 .await?;
                 let wid = workspace_id.clone();
-                writer_handle.send(Box::new(move |conn| writer::delete_stale_files(conn, &wid, &current_files)));
+                let touched_for_op = touched.clone();
+                writer_handle.send(Box::new(move |conn| {
+                    let removed = writer::delete_stale_files(conn, &wid, &current_files)?;
+                    touched_for_op.merge_removed(removed);
+                    Ok(())
+                }));
             }
             IndexScope::Paths(paths) => {
                 let root_for_check = root.clone();
@@ -266,7 +321,12 @@ impl Indexer {
                 .await?;
                 if !vanished.is_empty() {
                     let wid = workspace_id.clone();
-                    writer_handle.send(Box::new(move |conn| writer::delete_specific_files(conn, &wid, &vanished)));
+                    let touched_for_op = touched.clone();
+                    writer_handle.send(Box::new(move |conn| {
+                        let removed = writer::delete_specific_files(conn, &wid, &vanished)?;
+                        touched_for_op.merge_removed(removed);
+                        Ok(())
+                    }));
                 }
             }
         }
@@ -328,20 +388,43 @@ impl Indexer {
         let crate_graph_ms = before_crate_graph.elapsed().as_millis();
 
         // Phase 7: recompute callsite_count / type_use_count — needs every
-        // call_edges/type_use_edges row from Phase 4 committed first. The
-        // barrier right after `send` below (not this one) is what actually
-        // waits for these two `UPDATE`s to execute and commit — folded into
-        // the final line as `counts_ms`, the correlated-subquery `UPDATE`s'
-        // own cost isolated from every other phase's.
+        // call_edges/type_use_edges row from Phase 4 (and Phase 5's stale-
+        // file cleanup) committed first, which is exactly what this barrier
+        // waits for — including every `TouchedRefs` side effect those ops'
+        // closures recorded, since a closure has already run by the time
+        // the barrier it precedes returns. A `force=true` full rebuild
+        // touches virtually every name/symbol anyway, so it keeps the
+        // original whole-workspace bulk `UPDATE`s; every other run (the
+        // common case — an incremental `POST /index` or a watcher-
+        // triggered `run_changed_paths`) scopes the recompute to exactly
+        // the names/symbols `touched` recorded instead of reading the
+        // entire workspace's `symbols` table — this is what makes the
+        // post-index recompute proportional to changed files instead of
+        // O(whole workspace) (2026-09-24 read-path audit: ~30 min against
+        // the live 2.76 GB DB for a recompute that touched a handful of
+        // files). The barrier right after `send` below (not this one) is
+        // what actually waits for the `UPDATE`(s) to execute and commit —
+        // folded into the final line as `counts_ms`.
         writer_handle.barrier_async().await;
+        let is_full_rebuild = matches!(scope, IndexScope::Full) && req.force;
+        let (touched_names, touched_type_ids) = touched.take();
         {
             let wid = workspace_id.clone();
             writer_handle.send(Box::new(move |conn| {
-                if let Err(e) = writer::update_callsite_counts(conn, &wid) {
-                    tracing::warn!("callsite_count update error: {e}");
-                }
-                if let Err(e) = writer::update_type_use_counts(conn, &wid) {
-                    tracing::warn!("type_use_count update error: {e}");
+                if is_full_rebuild {
+                    if let Err(e) = writer::update_callsite_counts(conn, &wid) {
+                        tracing::warn!("callsite_count update error: {e}");
+                    }
+                    if let Err(e) = writer::update_type_use_counts(conn, &wid) {
+                        tracing::warn!("type_use_count update error: {e}");
+                    }
+                } else {
+                    if let Err(e) = writer::update_callsite_counts_for_names(conn, &wid, &touched_names) {
+                        tracing::warn!("scoped callsite_count update error: {e}");
+                    }
+                    if let Err(e) = writer::update_type_use_counts_for_symbols(conn, &wid, &touched_type_ids) {
+                        tracing::warn!("scoped type_use_count update error: {e}");
+                    }
                 }
                 Ok(())
             }));
@@ -393,8 +476,17 @@ impl Indexer {
 /// call edges, file edges, then resolve and insert type-use edges. The
 /// name→id map is rebuilt from `conn` (the live flush transaction) so it
 /// picks up symbols committed by an earlier file's op in the same batch.
-fn write_one_file(conn: &rusqlite::Connection, workspace_id: &str, pf: &ParsedFile) -> rusqlite::Result<()> {
-    writer::delete_file_symbols(conn, workspace_id, &pf.rel_path)?;
+/// Every new/removed `call_edges.callee_name`/`type_use_edges.to_symbol_id`
+/// this file's writes touch is recorded into `touched` — see
+/// [`TouchedRefs`]'s own doc comment.
+fn write_one_file(
+    conn: &rusqlite::Connection,
+    workspace_id: &str,
+    pf: &ParsedFile,
+    touched: &TouchedRefs,
+) -> rusqlite::Result<()> {
+    let removed = writer::delete_file_symbols(conn, workspace_id, &pf.rel_path)?;
+    touched.merge_removed(removed);
 
     let file_rec = FileRecord {
         workspace_id: workspace_id.to_string(),
@@ -429,8 +521,9 @@ fn write_one_file(conn: &rusqlite::Connection, workspace_id: &str, pf: &ParsedFi
         let mut edge = edge.clone();
         edge.workspace_id = workspace_id.to_string();
         edge.caller_symbol_id = resolve_caller_id(&line_to_id, edge.line);
-        if let Err(e) = writer::insert_call_edge(conn, &edge) {
-            tracing::warn!("call edge insert error: {e}");
+        match writer::insert_call_edge(conn, &edge) {
+            Ok(()) => touched.add_callee_name(&edge.callee_name),
+            Err(e) => tracing::warn!("call edge insert error: {e}"),
         }
     }
 
@@ -467,8 +560,9 @@ fn write_one_file(conn: &rusqlite::Connection, workspace_id: &str, pf: &ParsedFi
                         to_symbol_id: to_id,
                         use_kind: pending.use_kind,
                     };
-                    if let Err(e) = writer::insert_type_use_edge(conn, &edge) {
-                        tracing::warn!("type_use_edge insert error: {e}");
+                    match writer::insert_type_use_edge(conn, &edge) {
+                        Ok(()) => touched.add_type_use_to_id(to_id),
+                        Err(e) => tracing::warn!("type_use_edge insert error: {e}"),
                     }
                 }
             }
@@ -1313,6 +1407,146 @@ mod tests {
             vec!["A-start", "A-end", "B-start", "B-end"],
             "runs for the same workspace must never interleave: {final_log:?}"
         );
+
+        drop(writer);
+        drop(reader_pool);
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    async fn read_callsite_count(reader_pool: &DbPool, workspace_id: &str, name: &str) -> i64 {
+        let wid = workspace_id.to_string();
+        let name = name.to_string();
+        reader_pool
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COALESCE(SUM(callsite_count), -1) FROM symbols WHERE workspace_id = ?1 AND name = ?2",
+                    rusqlite::params![wid, name],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .expect("read callsite_count")
+    }
+
+    /// Defect fix (2026-09-24 read-path audit, incremental Phase 7): the
+    /// scoped recompute must still zero out a symbol's `callsite_count`
+    /// when its ONLY caller stops calling it — the callee's OWN file is
+    /// untouched by this edit, so the callee is never itself re-parsed;
+    /// the only way its count gets recomputed at all is via
+    /// `writer::delete_file_edges` capturing the REMOVED `callee_name`
+    /// from the caller's old `call_edges` row before deleting it, and
+    /// `TouchedRefs` carrying that into Phase 7's scoped `UPDATE`.
+    #[tokio::test]
+    async fn incremental_recompute_zeroes_out_callsite_count_when_the_only_call_is_removed() {
+        let (db, writer, reader_pool, db_path) = test_writer_and_pool("incremental-counts").await;
+
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "m4a-indexer-incremental-counts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root dir");
+        write_rust_file(&root, "caller.rs", "pub fn caller() { callee(); }\n");
+        write_rust_file(&root, "callee.rs", "pub fn callee() {}\n");
+
+        let req = IndexRequest {
+            workspace_id: "ws".to_string(),
+            root_path: root.to_string_lossy().replace('\\', "/"),
+            workspace_name: "ws".to_string(),
+            force: false,
+        };
+
+        Indexer::run(&reader_pool, &writer, &req).await.expect("first run succeeds");
+        assert_eq!(
+            read_callsite_count(&reader_pool, "ws", "callee").await,
+            1,
+            "callee must show one callsite right after the first run"
+        );
+
+        // Remove the call — callee.rs itself is untouched.
+        write_rust_file(&root, "caller.rs", "pub fn caller() {}\n");
+        Indexer::run(&reader_pool, &writer, &req).await.expect("second (incremental) run succeeds");
+
+        assert_eq!(
+            read_callsite_count(&reader_pool, "ws", "callee").await,
+            0,
+            "the scoped incremental recompute must still zero out callee's callsite_count \
+             once its only caller stops calling it"
+        );
+
+        drop(writer);
+        drop(reader_pool);
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Defect fix (2026-09-24 read-path audit): unlike `symbols` (which
+    /// cascades off `file_records` via its own foreign key),
+    /// `call_edges`/`type_use_edges` carry none — a file removed from disk
+    /// entirely (handled by `writer::delete_stale_files`, not
+    /// `writer::delete_file_symbols`) used to leave its own outgoing
+    /// `call_edges` rows behind forever, permanently inflating whatever
+    /// name they pointed at.
+    #[tokio::test]
+    async fn deleting_a_file_from_disk_also_removes_its_own_call_edges() {
+        let (db, writer, reader_pool, db_path) = test_writer_and_pool("deleted-file-edges").await;
+
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "m4a-indexer-deleted-file-edges-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root dir");
+        write_rust_file(&root, "caller.rs", "pub fn caller() { callee(); }\n");
+        write_rust_file(&root, "callee.rs", "pub fn callee() {}\n");
+
+        let req = IndexRequest {
+            workspace_id: "ws".to_string(),
+            root_path: root.to_string_lossy().replace('\\', "/"),
+            workspace_name: "ws".to_string(),
+            force: false,
+        };
+
+        Indexer::run(&reader_pool, &writer, &req).await.expect("first run succeeds");
+        assert_eq!(read_callsite_count(&reader_pool, "ws", "callee").await, 1);
+
+        // caller.rs is removed from disk entirely (not edited) — a full
+        // `Indexer::run` re-walk must notice it via delete_stale_files.
+        std::fs::remove_file(root.join("caller.rs")).expect("remove caller.rs");
+        Indexer::run(&reader_pool, &writer, &req).await.expect("second run succeeds");
+
+        assert_eq!(
+            read_callsite_count(&reader_pool, "ws", "callee").await,
+            0,
+            "callee's callsite_count must drop once its only caller's file is gone — \
+             a lingering call_edges row for the deleted file would keep it inflated forever"
+        );
+
+        let wid = "ws".to_string();
+        let leftover_edges: i64 = reader_pool
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM call_edges WHERE workspace_id = ?1 AND caller_file = 'caller.rs'",
+                    rusqlite::params![wid],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .expect("read call_edges count");
+        assert_eq!(leftover_edges, 0, "call_edges for a file gone from disk must not linger");
 
         drop(writer);
         drop(reader_pool);

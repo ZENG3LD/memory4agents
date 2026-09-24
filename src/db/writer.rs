@@ -42,17 +42,69 @@ pub fn upsert_file_record(conn: &Connection, rec: &FileRecord) -> rusqlite::Resu
     Ok(())
 }
 
-/// Delete all symbols for a given file (cascade removes trigrams; also cleans call/type edges).
+/// Identifiers whose denormalised `symbols.callsite_count` /
+/// `symbols.type_use_count` may now be stale after a file's edges were
+/// removed — returned by [`delete_file_edges`] (via [`delete_file_symbols`],
+/// [`delete_stale_files`], [`delete_specific_files`]) so
+/// `index::indexer`'s Phase 7 recompute can be scoped to exactly what this
+/// run's changes could have affected instead of the whole workspace.
+#[derive(Default, Debug)]
+pub struct RemovedFileRefs {
+    /// Distinct `call_edges.callee_name` values the file's own (now
+    /// deleted) call edges used to reference.
+    pub callee_names: HashSet<String>,
+    /// Distinct `type_use_edges.to_symbol_id` values the file's own (now
+    /// deleted) type-use edges used to reference, on either side (a
+    /// removed edge FROM this file's symbol still changes some OTHER
+    /// symbol's inbound count).
+    pub type_use_to_ids: HashSet<i64>,
+}
+
+impl RemovedFileRefs {
+    fn merge(&mut self, other: RemovedFileRefs) {
+        self.callee_names.extend(other.callee_names);
+        self.type_use_to_ids.extend(other.type_use_to_ids);
+    }
+}
+
+/// Captures (before deleting) the callee names / type-use target ids a
+/// file's own `call_edges`/`type_use_edges` rows reference, then deletes
+/// those rows — but NOT the file's own `symbols`/`file_records` rows,
+/// which is why this is a private helper rather than `delete_file_symbols`
+/// itself: [`delete_file_symbols`] (a re-indexed file — the caller
+/// re-upserts `file_records` right after) and [`delete_stale_files`] /
+/// [`delete_specific_files`] (a file gone from disk entirely — the caller
+/// deletes `file_records` too, cascading `symbols`) both need this same
+/// edge cleanup first.
 ///
-/// Every statement here is prepared once per connection lifetime via
-/// [`Connection::prepare_cached`] and reused for every call after — see the
-/// module doc comment on why this matters for indexing throughput.
-pub fn delete_file_symbols(
+/// Load-bearing, not cosmetic: unlike `symbols` (which cascades off
+/// `file_records` via its own `FOREIGN KEY ... ON DELETE CASCADE` —
+/// `storage::migrations::BASE_TABLES_SQL`), neither `call_edges` nor
+/// `type_use_edges` carries a foreign key at all. Before this fix,
+/// [`delete_stale_files`]/[`delete_specific_files`] relied only on that
+/// cascade and never touched `call_edges`/`type_use_edges` for a file
+/// removed from disk — every edge FROM that file's own (now-gone) symbols
+/// lingered forever, permanently inflating whatever `callee_name` or
+/// `to_symbol_id` it used to point at.
+fn delete_file_edges(
     conn: &Connection,
     workspace_id: &str,
     file_path: &str,
-) -> rusqlite::Result<()> {
-    // Collect symbol ids before deleting, so we can remove type_use_edges.
+) -> rusqlite::Result<RemovedFileRefs> {
+    let mut removed = RemovedFileRefs::default();
+
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT callee_name FROM call_edges WHERE workspace_id = ?1 AND caller_file = ?2",
+        )?;
+        let rows = stmt.query_map(params![workspace_id, file_path], |row| row.get::<_, String>(0))?;
+        for name in rows.filter_map(|r| r.ok()) {
+            removed.callee_names.insert(name);
+        }
+    }
+
+    // Collect symbol ids before deleting, so we can remove type_use_edges
+    // and capture which OTHER symbols' type_use_count this touches.
     let ids: Vec<i64> = {
         let mut stmt = conn.prepare_cached(
             "SELECT id FROM symbols WHERE workspace_id = ?1 AND file_path = ?2",
@@ -64,6 +116,18 @@ pub fn delete_file_symbols(
         collected
     };
 
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT to_symbol_id FROM type_use_edges WHERE workspace_id = ?1 AND (from_symbol_id = ?2 OR to_symbol_id = ?2)",
+        )?;
+        for id in &ids {
+            let rows = stmt.query_map(params![workspace_id, id], |row| row.get::<_, i64>(0))?;
+            for to_id in rows.filter_map(|r| r.ok()) {
+                removed.type_use_to_ids.insert(to_id);
+            }
+        }
+    }
+
     // Delete type_use_edges where this file's symbols appear on either side.
     let mut delete_type_use_edges = conn.prepare_cached(
         "DELETE FROM type_use_edges WHERE workspace_id = ?1 AND (from_symbol_id = ?2 OR to_symbol_id = ?2)",
@@ -72,11 +136,26 @@ pub fn delete_file_symbols(
         delete_type_use_edges.execute(params![workspace_id, id])?;
     }
 
-    conn.prepare_cached("DELETE FROM symbols WHERE workspace_id = ?1 AND file_path = ?2")?
-        .execute(params![workspace_id, file_path])?;
     conn.prepare_cached("DELETE FROM call_edges WHERE workspace_id = ?1 AND caller_file = ?2")?
         .execute(params![workspace_id, file_path])?;
-    Ok(())
+
+    Ok(removed)
+}
+
+/// Delete all symbols for a given file (cascade removes trigrams; also cleans call/type edges).
+///
+/// Every statement here is prepared once per connection lifetime via
+/// [`Connection::prepare_cached`] and reused for every call after — see the
+/// module doc comment on why this matters for indexing throughput.
+pub fn delete_file_symbols(
+    conn: &Connection,
+    workspace_id: &str,
+    file_path: &str,
+) -> rusqlite::Result<RemovedFileRefs> {
+    let removed = delete_file_edges(conn, workspace_id, file_path)?;
+    conn.prepare_cached("DELETE FROM symbols WHERE workspace_id = ?1 AND file_path = ?2")?
+        .execute(params![workspace_id, file_path])?;
+    Ok(removed)
 }
 
 /// Insert a symbol and return its new rowid.
@@ -164,6 +243,90 @@ pub fn update_callsite_counts(conn: &Connection, workspace_id: &str) -> rusqlite
          WHERE symbols.workspace_id = ?1",
         params![workspace_id],
     )?;
+    Ok(())
+}
+
+/// Ceiling on how many placeholders [`update_callsite_counts_for_names`]/
+/// [`update_type_use_counts_for_symbols`] put in one `IN (...)` clause —
+/// chunked regardless of the SQLite build's own variable-count ceiling, and
+/// to keep each individual statement's own planning cost bounded even for
+/// an unusually large touched set (e.g. a broad rename sweep).
+const MAX_IN_CLAUSE: usize = 500;
+
+/// Scoped version of [`update_callsite_counts`]: recomputes `callsite_count`
+/// only for symbols named one of `names`, instead of the whole workspace.
+/// Used by `index::indexer`'s incremental Phase 7 (only files/symbols this
+/// run's changes actually touched) — the whole-workspace version stays in
+/// use for a `force=true` full rebuild, where virtually every name is
+/// touched anyway and one bulk `UPDATE` beats `names.len()` narrow ones.
+/// No-op on an empty `names` (nothing to recompute).
+pub fn update_callsite_counts_for_names(
+    conn: &Connection,
+    workspace_id: &str,
+    names: &HashSet<String>,
+) -> rusqlite::Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let all: Vec<&String> = names.iter().collect();
+    for chunk in all.chunks(MAX_IN_CLAUSE) {
+        let placeholders: Vec<String> = (2..2 + chunk.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "UPDATE symbols
+             SET callsite_count = (
+                 SELECT COUNT(*) FROM call_edges
+                 WHERE call_edges.workspace_id = symbols.workspace_id
+                   AND call_edges.callee_name = symbols.name
+             )
+             WHERE symbols.workspace_id = ?1 AND symbols.name IN ({})",
+            placeholders.join(", ")
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(chunk.len() + 1);
+        param_values.push(Box::new(workspace_id.to_owned()));
+        for name in chunk {
+            param_values.push(Box::new((*name).clone()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+        conn.execute(&sql, refs.as_slice())?;
+    }
+    Ok(())
+}
+
+/// Scoped version of [`update_type_use_counts`]: recomputes `type_use_count`
+/// only for the given symbol ids, instead of the whole workspace. Same
+/// `INDEXED BY idx_type_use_to` hint and the same full-rebuild-keeps-the-
+/// whole-workspace-version rationale as [`update_callsite_counts_for_names`].
+/// No-op on an empty `symbol_ids`.
+pub fn update_type_use_counts_for_symbols(
+    conn: &Connection,
+    workspace_id: &str,
+    symbol_ids: &HashSet<i64>,
+) -> rusqlite::Result<()> {
+    if symbol_ids.is_empty() {
+        return Ok(());
+    }
+    let all: Vec<i64> = symbol_ids.iter().copied().collect();
+    for chunk in all.chunks(MAX_IN_CLAUSE) {
+        let placeholders: Vec<String> = (2..2 + chunk.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "UPDATE symbols
+             SET type_use_count = (
+                 SELECT COUNT(DISTINCT from_symbol_id)
+                 FROM type_use_edges INDEXED BY idx_type_use_to
+                 WHERE type_use_edges.workspace_id = symbols.workspace_id
+                   AND type_use_edges.to_symbol_id = symbols.id
+             )
+             WHERE symbols.workspace_id = ?1 AND symbols.id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(chunk.len() + 1);
+        param_values.push(Box::new(workspace_id.to_owned()));
+        for id in chunk {
+            param_values.push(Box::new(*id));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+        conn.execute(&sql, refs.as_slice())?;
+    }
     Ok(())
 }
 
@@ -322,12 +485,18 @@ pub fn delete_stale_crate_dep_edges(
     Ok(())
 }
 
-/// Delete file records (and cascade-delete their symbols) for files no longer on disk.
+/// Delete file records (and cascade-delete their symbols) for files no
+/// longer on disk. Also removes each file's own `call_edges`/
+/// `type_use_edges` rows via [`delete_file_edges`] first — see that
+/// function's doc comment for why `file_records`' cascade alone isn't
+/// enough — and returns the union of every deleted file's [`RemovedFileRefs`]
+/// for `index::indexer`'s scoped Phase 7 recompute.
 pub fn delete_stale_files(
     conn: &Connection,
     workspace_id: &str,
     current_files: &HashSet<String>,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<RemovedFileRefs> {
+    let mut removed = RemovedFileRefs::default();
     let mut stmt = conn.prepare(
         "SELECT file_path FROM file_records WHERE workspace_id = ?1",
     )?;
@@ -338,13 +507,14 @@ pub fn delete_stale_files(
 
     for path in stored {
         if !current_files.contains(&path) {
+            removed.merge(delete_file_edges(conn, workspace_id, &path)?);
             conn.execute(
                 "DELETE FROM file_records WHERE workspace_id = ?1 AND file_path = ?2",
                 params![workspace_id, path],
             )?;
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
 /// Delete file records (and cascade-delete their symbols) for exactly the
@@ -353,18 +523,22 @@ pub fn delete_stale_files(
 /// via a direct filesystem check that these specific paths no longer exist,
 /// rather than diffing a full disk walk against every stored file the way
 /// [`delete_stale_files`] does. Unconditional per given path — deleting a
-/// path with no matching row is simply a no-op.
+/// path with no matching row is simply a no-op. Same `call_edges`/
+/// `type_use_edges` cleanup as [`delete_stale_files`] via [`delete_file_edges`];
+/// returns the union [`RemovedFileRefs`].
 pub fn delete_specific_files(
     conn: &Connection,
     workspace_id: &str,
     paths: &HashSet<String>,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<RemovedFileRefs> {
+    let mut removed = RemovedFileRefs::default();
     for path in paths {
+        removed.merge(delete_file_edges(conn, workspace_id, path)?);
         conn.execute(
             "DELETE FROM file_records WHERE workspace_id = ?1 AND file_path = ?2",
             params![workspace_id, path],
         )?;
     }
-    Ok(())
+    Ok(removed)
 }
 
