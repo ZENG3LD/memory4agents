@@ -286,7 +286,10 @@ pub struct SearchHit {
 /// `file_count` are the LAST KNOWN values from a background cache, not a
 /// live database query — see `server::stats`. `stats_age_secs` tells the
 /// caller how stale those numbers are; `None` means no refresh has
-/// completed yet (e.g. right after server startup).
+/// completed yet (e.g. right after server startup). `phase` and
+/// `snapshots` (piece 0.12, item 5) are read straight from atomics/an
+/// `RwLock`-guarded map — never the database — so this handler answers
+/// instantly at any point in the boot sequence; see `server::startup`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthStatus {
     pub ok: bool,
@@ -297,6 +300,31 @@ pub struct HealthStatus {
     /// Age in seconds of the cached stats above, or `None` if not yet refreshed.
     #[serde(default)]
     pub stats_age_secs: Option<u64>,
+    /// Boot-sequence phase — `"migrating"` | `"building_snapshot"` |
+    /// `"ready"`. See `server::startup::StartupPhase`.
+    #[serde(default = "default_phase")]
+    pub phase: String,
+    /// Per-workspace read-model snapshot health — empty before any
+    /// snapshot has been built.
+    #[serde(default)]
+    pub snapshots: Vec<SnapshotHealth>,
+}
+
+fn default_phase() -> String {
+    "ready".to_string()
+}
+
+/// One workspace's read-model snapshot health, surfaced by `/health` and
+/// `mem_health` (piece 0.12, item 5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotHealth {
+    pub workspace_id: String,
+    pub symbol_count: u32,
+    pub file_count: u32,
+    pub call_edge_count: u32,
+    pub age_secs: u64,
+    pub build_ms: u64,
+    pub estimated_bytes: u64,
 }
 
 /// Aggregate statistics for a workspace.

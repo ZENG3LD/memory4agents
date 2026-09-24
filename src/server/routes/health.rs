@@ -21,23 +21,33 @@ pub fn router() -> DocRouter<SharedState> {
             "/health",
             get_health,
             RouteDoc::new(
-                "Liveness probe — cached DB stats, never queries the database. \
-                 d-watchdog health-checks this with a 45s timeout because a cold \
-                 restart's first refresh scans a multi-GB index.",
+                "Liveness probe — cached DB stats + boot-sequence phase \
+                 (migrating/building_snapshot/ready), never queries the database or \
+                 blocks on anything migrations/the read-model build could be holding. \
+                 Answers instantly from the very first second the listener is bound, \
+                 even mid-migration (owner ruling 2026-09-24) — see server::startup.",
             )
             .public(),
         )
         .get(
             "/ready",
             get_ready,
-            RouteDoc::new("Readiness probe — bounded SELECT 1; 503 if the reader pool is exhausted/unreachable").public(),
+            RouteDoc::new(
+                "Readiness probe — 503 with the boot phase before migrations/the read-model \
+                 build finish; once ready, a bounded SELECT 1, 503 if the reader pool is \
+                 exhausted/unreachable",
+            )
+            .public(),
         )
 }
 
 /// Pure liveness snapshot: never queries the database and never blocks on a
 /// lock a long-running request could be holding — it only reads the
-/// in-memory cache kept fresh by `server::stats::spawn_stats_refresher`.
-/// Shared by the `GET /health` route and the `mem_health` MCP tool
+/// in-memory cache kept fresh by `server::stats::spawn_stats_refresher`,
+/// the boot-sequence phase (a single atomic load — see `server::startup`),
+/// and the read model's own `RwLock`-guarded stats map (clone-and-drop-the-
+/// lock, same discipline as every other [`crate::model::ReadModel`]
+/// reader). Shared by the `GET /health` route and the `mem_health` MCP tool
 /// (`server::routes::mcp`) — one code path for this capability.
 pub(crate) fn health_snapshot(state: &SharedState) -> HealthStatus {
     let cache = state
@@ -45,6 +55,20 @@ pub(crate) fn health_snapshot(state: &SharedState) -> HealthStatus {
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let db_path = format!("{}/index.db", state.data_dir);
+    let snapshots = state
+        .read_model
+        .stats()
+        .into_iter()
+        .map(|summary| crate::types::SnapshotHealth {
+            workspace_id: summary.workspace_id,
+            symbol_count: summary.stats.symbol_count,
+            file_count: summary.stats.file_count,
+            call_edge_count: summary.stats.call_edge_count,
+            age_secs: summary.age_secs,
+            build_ms: summary.stats.build_ms,
+            estimated_bytes: summary.stats.estimated_bytes,
+        })
+        .collect();
     HealthStatus {
         ok: cache.ok,
         db_path,
@@ -52,6 +76,8 @@ pub(crate) fn health_snapshot(state: &SharedState) -> HealthStatus {
         symbol_count: cache.symbol_count,
         file_count: cache.file_count,
         stats_age_secs: cache.age_secs(),
+        phase: state.startup.get().to_string(),
+        snapshots,
     }
 }
 
@@ -68,12 +94,23 @@ struct ReadyStatus {
 
 /// Readiness probe: can the store actually answer a query right now?
 ///
-/// Checks out one reader-pool connection and runs a trivial `SELECT 1` in
-/// `spawn_blocking`, bounding the whole wait with [`READY_TIMEOUT`]. Unlike
-/// the retired mutex-backed implementation, this never waits on a heavy
-/// analytics route or `/index` — it only ever waits for one of the reader
-/// pool's own N slots.
+/// Before migrations/the initial read-model build complete (see
+/// `server::startup`), this reports not-ready with the current phase
+/// WITHOUT touching the database — a query against a not-yet-migrated
+/// schema is a meaningless signal, not a real "is it down" probe. Once
+/// `Ready`, it checks out one reader-pool connection and runs a trivial
+/// `SELECT 1` in `spawn_blocking`, bounding the whole wait with
+/// [`READY_TIMEOUT`] — this never waits on a heavy analytics route or
+/// `/index`, only for one of the reader pool's own N slots.
 async fn get_ready(State(state): State<SharedState>) -> impl IntoResponse {
+    if !state.startup.is_ready() {
+        let phase = state.startup.get().to_string();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadyStatus { ready: false, error: Some(format!("server starting up: phase={phase}")) }),
+        );
+    }
+
     let (status, body) = match tokio::time::timeout(READY_TIMEOUT, ready_probe(&state)).await {
         Ok(Ok(())) => (StatusCode::OK, ReadyStatus { ready: true, error: None }),
         Ok(Err(msg)) => (
@@ -104,6 +141,8 @@ async fn ready_probe(state: &SharedState) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::index::lock::IndexLocks;
+    use crate::model::ReadModel;
+    use crate::server::startup::StartupState;
     use crate::server::state::{with_db, AppError, AppState};
     use crate::server::stats::StatsCache;
     use crate::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool};
@@ -121,6 +160,8 @@ mod tests {
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
+            read_model: ReadModel::new(),
+            startup: StartupState::ready(),
         })
     }
 

@@ -3,6 +3,8 @@ use axum::response::{IntoResponse, Response};
 use axum::http::StatusCode;
 use crate::index::job::IndexJobStatus;
 use crate::index::lock::IndexLocks;
+use crate::model::{ReadModel, Snapshot};
+use crate::server::startup::{StartupPhase, StartupState};
 use crate::server::stats::StatsCache;
 use crate::storage::{BatchWriter, DbPool};
 use crate::CoreError;
@@ -30,6 +32,14 @@ pub struct AppState {
     /// synchronous `POST /index` call does not touch this. See
     /// [`crate::index::job::IndexJobStatus`].
     pub last_index: Arc<RwLock<Option<IndexJobStatus>>>,
+    /// In-memory read model (piece 0.12) — every ported hot route
+    /// (`server::routes::ast`, `graph`, `usage::type_usage`) reads from
+    /// this instead of `reader_pool`. See [`snapshot`]/[`all_snapshots`].
+    pub read_model: ReadModel,
+    /// Boot-sequence phase — see `server::startup`. `/health` reports it
+    /// without gating on it; every other DB-touching route gates on it via
+    /// [`with_db`]/[`snapshot`]/[`all_snapshots`].
+    pub startup: StartupState,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -38,6 +48,11 @@ pub type SharedState = Arc<AppState>;
 pub enum AppError {
     Core(CoreError),
     Internal(String),
+    /// The server hasn't finished migrations/the initial read-model build
+    /// yet — see `server::startup`. Every DB-touching route (`with_db`,
+    /// [`snapshot`], [`all_snapshots`]) returns this instead of touching a
+    /// possibly-un-migrated schema or an empty read model.
+    NotReady(StartupPhase),
 }
 
 impl From<CoreError> for AppError {
@@ -48,15 +63,27 @@ impl From<CoreError> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, msg) = match &self {
+        match self {
             AppError::Core(CoreError::WorkspaceNotFound { id }) => {
-                (StatusCode::NOT_FOUND, format!("workspace '{}' not found", id))
+                let msg = format!("workspace '{id}' not found");
+                (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error": msg}))).into_response()
             }
-            AppError::Core(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-        };
-        let body = serde_json::json!({"error": msg});
-        (status, axum::Json(body)).into_response()
+            AppError::Core(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({"error": e.to_string()})))
+                    .into_response()
+            }
+            AppError::Internal(msg) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({"error": msg}))).into_response()
+            }
+            AppError::NotReady(phase) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({
+                    "error": "server starting up",
+                    "phase": phase.to_string(),
+                })),
+            )
+                .into_response(),
+        }
     }
 }
 
@@ -77,6 +104,9 @@ where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection) -> Result<T, AppError> + Send + 'static,
 {
+    if !state.startup.is_ready() {
+        return Err(AppError::NotReady(state.startup.get()));
+    }
     let guard = state
         .reader_pool
         .acquire()
@@ -85,6 +115,46 @@ where
     tokio::task::spawn_blocking(move || f(&guard))
         .await
         .map_err(|e| AppError::Internal(format!("task join error: {e}")))?
+}
+
+/// The read-model counterpart to [`with_db`]: returns the current snapshot
+/// for `workspace_id`, gated on [`crate::server::startup::StartupState::is_ready`].
+/// Ported hot routes (`server::routes::ast`, `graph`,
+/// `usage::type_usage_impl`) call this instead of `with_db`.
+///
+/// A workspace with no loaded snapshot (never indexed, or indexed for the
+/// first time after boot and not yet rebuilt into the read model — see
+/// [`crate::model::read_model::request_rebuild`]) resolves to
+/// [`crate::model::Snapshot::empty`], NOT an error: every query method
+/// against an empty snapshot naturally returns an empty result, matching
+/// what the retired SQL functions returned for a `WHERE workspace_id = ?`
+/// scan over an unknown/never-indexed workspace id.
+pub fn snapshot(state: &SharedState, workspace_id: &str) -> Result<Arc<Snapshot>, AppError> {
+    if !state.startup.is_ready() {
+        return Err(AppError::NotReady(state.startup.get()));
+    }
+    Ok(state.read_model.get(workspace_id).unwrap_or_else(|| Arc::new(Snapshot::empty(workspace_id))))
+}
+
+/// Cross-workspace variant for the (rare) `workspace=None` query shape a
+/// few routes accept, matching `db::reader`'s own `Option<&str>` convention
+/// where `None` means "every workspace".
+pub fn all_snapshots(state: &SharedState) -> Result<Vec<Arc<Snapshot>>, AppError> {
+    if !state.startup.is_ready() {
+        return Err(AppError::NotReady(state.startup.get()));
+    }
+    Ok(state.read_model.all())
+}
+
+/// Convenience wrapper used by every ported route: resolves to a single
+/// snapshot when `workspace` is given, or every currently-loaded workspace
+/// when it is `None` — the read-model equivalent of calling a `db::reader`
+/// function with `workspace_id: Option<&str>`.
+pub fn snapshots_for(state: &SharedState, workspace: Option<&str>) -> Result<Vec<Arc<Snapshot>>, AppError> {
+    match workspace {
+        Some(ws) => Ok(vec![snapshot(state, ws)?]),
+        None => all_snapshots(state),
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +200,8 @@ mod tests {
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
+            read_model: ReadModel::new(),
+            startup: StartupState::ready(),
         });
 
         // Kick off a deliberately slow read on the pool (simulates a heavy
