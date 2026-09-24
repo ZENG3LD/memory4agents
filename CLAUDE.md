@@ -129,7 +129,7 @@ curl -X POST "http://127.0.0.1:18200/index" \
 |----------|----------|
 | `/ast/search?q=NAME` | Fuzzy symbol search (functions, structs, traits) |
 | `/ast/symbols?file=PATH&workspace=nemo` | List all symbols in a file |
-| `/ast/callers?sym=NAME&workspace=nemo` | Who calls this symbol |
+| `/ast/callers?sym=NAME&workspace=nemo` | Who calls this symbol. Capped at 1000 callers (SQL `LIMIT`). A bare name with more than 20 definitions in the workspace (e.g. `new`) is refused with `{ambiguous: true, definition_count, message}` instead of computing callers for all of them — pass a more specific name, or narrow via `/ast/type_usage`/a file, first. Same guard covers `mem_symbol what="callers"` (shared `*_impl`). |
 | `/ast/deps?file=PATH&workspace=nemo` | File dependencies |
 | `/graph/crates?workspace=nemo` | Crate dependency tree |
 | `/graph/impact?file=PATH&workspace=nemo` | What breaks if this file changes (file-level, BFS over `file_edges`) |

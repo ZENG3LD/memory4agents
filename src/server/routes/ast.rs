@@ -11,6 +11,17 @@ use crate::search::trigram::fuzzy_search;
 use crate::server::state::{with_db, AppError, SharedState};
 use crate::types::Symbol;
 
+/// A bare name defined more than this many times in a workspace is refused
+/// by [`callers_of_symbol_impl`] with a named "ambiguous" response instead
+/// of computing callers for every one of them — the same shared `*_impl`
+/// function both `/ast/callers` (HTTP) and `mem_symbol what="callers"`
+/// (MCP) call, so one guard covers both doors. Reproduces the reported
+/// hang: `"new"` has 18,416 definitions and ~139k distinct call sites in
+/// the live `nemo` workspace (2026-09-24 read-path audit) — computing
+/// "who calls new" is not a meaningful question without narrowing by file
+/// or type first.
+pub(crate) const AMBIGUOUS_DEFINITION_THRESHOLD: u32 = 20;
+
 pub fn router() -> DocRouter<SharedState> {
     DocRouter::new()
         .get("/ast/search", search_symbols, RouteDoc::new("Fuzzy symbol search by name (?q=NAME)").public())
@@ -145,6 +156,19 @@ pub(crate) async fn callers_of_symbol_impl(
     params: SymQuery,
 ) -> Result<serde_json::Value, AppError> {
     with_db(state, move |db| {
+        let definition_count =
+            reader::count_symbol_definitions(db, &params.sym, params.workspace.as_deref())?;
+        if definition_count > AMBIGUOUS_DEFINITION_THRESHOLD {
+            return Ok(serde_json::json!({
+                "ambiguous": true,
+                "sym": params.sym,
+                "definition_count": definition_count,
+                "message": format!(
+                    "ambiguous: {definition_count} definitions of '{}' — pass a file or type to disambiguate",
+                    params.sym
+                ),
+            }));
+        }
         let results = reader::get_callers_of(db, &params.sym, params.workspace.as_deref())?;
         Ok(serde_json::json!(results))
     })
@@ -819,4 +843,151 @@ async fn impl_summary(
     Query(params): Query<ImplSummaryQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     Ok(Json(impl_summary_impl(&state, params).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::writer;
+    use crate::index::lock::IndexLocks;
+    use crate::server::state::AppState;
+    use crate::server::stats::StatsCache;
+    use crate::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool, MigrationRunner};
+    use crate::types::{CallEdge, FileRecord, Symbol, SymbolKind, Visibility};
+    use std::sync::{Arc, RwLock};
+
+    fn temp_db_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "m4a-ast-callers-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn test_symbol(workspace_id: &str, file_path: &str, name: &str, line: u32) -> Symbol {
+        Symbol {
+            id: 0,
+            workspace_id: workspace_id.to_string(),
+            file_path: file_path.to_string(),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            line,
+            col: 0,
+            parent_name: None,
+            signature: None,
+            body_hash: None,
+            shape_fingerprint: None,
+            shape_fingerprint_loose: None,
+            field_count: None,
+            shape_summary: None,
+            callsite_count: 0,
+            type_use_count: 0,
+            impl_trait: None,
+        }
+    }
+
+    /// Seeds `def_count` definitions of `overloaded_name` (one per file) plus
+    /// a single caller symbol `caller` (in `caller.rs`) that calls it once —
+    /// enough to distinguish "the ambiguity guard refused" from "there just
+    /// happen to be no callers".
+    async fn seeded_state(overloaded_name: &str, def_count: u32) -> (SharedState, std::path::PathBuf) {
+        let path = temp_db_path("ambiguous");
+        let db = Db::open(&DbConfig::new(&path)).expect("writer db opens");
+        db.run_migrations(MigrationRunner::new(crate::storage::migrations::legacy_schema_migrations()))
+            .await
+            .expect("migration applies");
+
+        let write_db = db.clone();
+        let name = overloaded_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            write_db.write_blocking(|conn| {
+                writer::upsert_file_record(
+                    conn,
+                    &FileRecord { workspace_id: "ws".to_string(), file_path: "caller.rs".to_string(), mtime: 0, size: 0, symbol_count: 0 },
+                )?;
+                let caller_id = writer::insert_symbol(conn, &test_symbol("ws", "caller.rs", "caller", 1))?;
+                writer::insert_call_edge(
+                    conn,
+                    &CallEdge {
+                        workspace_id: "ws".to_string(),
+                        caller_file: "caller.rs".to_string(),
+                        caller_symbol_id: caller_id,
+                        callee_name: name.clone(),
+                        line: 1,
+                    },
+                )?;
+
+                for i in 0..def_count {
+                    let file = format!("def_{i}.rs");
+                    writer::upsert_file_record(
+                        conn,
+                        &FileRecord { workspace_id: "ws".to_string(), file_path: file.clone(), mtime: 0, size: 0, symbol_count: 0 },
+                    )?;
+                    writer::insert_symbol(conn, &test_symbol("ws", &file, &name, 1))?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .expect("join")
+        .expect("seed writes succeed");
+
+        let reader_pool = DbPool::open_with_size(&DbConfig::new(&path), 4).expect("reader pool opens");
+        let writer_handle = BatchWriter::new(db, BatchConfig::default());
+        let state: SharedState = Arc::new(AppState {
+            writer: writer_handle,
+            reader_pool,
+            data_dir: "test-data".to_string(),
+            stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+            index_locks: IndexLocks::new(),
+            last_index: Arc::new(RwLock::new(None)),
+        });
+        (state, path)
+    }
+
+    #[tokio::test]
+    async fn callers_of_a_name_at_the_threshold_computes_normally() {
+        let (state, path) = seeded_state("common_helper", AMBIGUOUS_DEFINITION_THRESHOLD).await;
+
+        let value = callers_of_symbol_impl(
+            &state,
+            SymQuery { sym: "common_helper".to_string(), workspace: Some("ws".to_string()) },
+        )
+        .await
+        .expect("callers_of_symbol_impl succeeds");
+
+        assert!(value.is_array(), "at-threshold definition count must NOT be refused: {value}");
+        let names: Vec<&str> = value.as_array().expect("array").iter().map(|s| s["name"].as_str().unwrap_or_default()).collect();
+        assert!(names.contains(&"caller"), "{names:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn callers_of_a_name_over_the_threshold_is_refused_as_ambiguous() {
+        let over = AMBIGUOUS_DEFINITION_THRESHOLD + 1;
+        let (state, path) = seeded_state("overloaded_name", over).await;
+
+        let value = callers_of_symbol_impl(
+            &state,
+            SymQuery { sym: "overloaded_name".to_string(), workspace: Some("ws".to_string()) },
+        )
+        .await
+        .expect("callers_of_symbol_impl succeeds");
+
+        assert_eq!(value["ambiguous"], true, "{value}");
+        assert_eq!(value["definition_count"], over, "{value}");
+        let message = value["message"].as_str().expect("message is a string");
+        assert!(message.contains("overloaded_name"), "{message}");
+        assert!(message.contains(&over.to_string()), "{message}");
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

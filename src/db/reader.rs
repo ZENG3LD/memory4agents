@@ -751,6 +751,32 @@ pub fn get_duplicate_names(
     Ok(rows)
 }
 
+/// Count how many symbols are named exactly `name`, optionally scoped to a
+/// workspace. A cheap `COUNT(*)` (covering-index scan on
+/// `idx_symbols_workspace_name` when `workspace_id` is given — migration
+/// v8) used to guard `/ast/callers` and `mem_symbol what="callers"` from
+/// ever materializing every call site of a bare, heavily-overloaded name:
+/// see `server::routes::ast::AMBIGUOUS_DEFINITION_THRESHOLD`.
+pub fn count_symbol_definitions(
+    conn: &Connection,
+    name: &str,
+    workspace_id: Option<&str>,
+) -> Result<u32, CoreError> {
+    let count: i64 = match workspace_id {
+        Some(ws) => conn.query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name = ?1 AND workspace_id = ?2",
+            params![name, ws],
+            |row| row.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?,
+    };
+    Ok(count as u32)
+}
+
 /// Count total symbols, optionally filtered by workspace.
 pub fn count_symbols(conn: &Connection, workspace_id: Option<&str>) -> Result<u32, CoreError> {
     match workspace_id {
