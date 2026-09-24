@@ -232,15 +232,26 @@ pub fn update_type_use_counts(conn: &Connection, workspace_id: &str) -> rusqlite
 /// `call_edges` has a plain `INTEGER PRIMARY KEY AUTOINCREMENT` rowid, so
 /// there is no competing same-prefix autoindex for the planner to prefer
 /// instead (unlike [`update_type_use_counts`]'s own `type_use_edges`).
+///
+/// The count depends only on the NAME (edges match callees by bare name), so
+/// it is computed once per distinct name with one `GROUP BY` pass and joined
+/// back, instead of a correlated `COUNT(*)` per symbol: a name like `new`
+/// has ~18k same-named symbols and ~250k edges, and the per-symbol form
+/// re-counted those 250k edges 18k times.
 pub fn update_callsite_counts(conn: &Connection, workspace_id: &str) -> rusqlite::Result<()> {
     conn.execute(
+        "UPDATE symbols SET callsite_count = 0 WHERE workspace_id = ?1 AND callsite_count <> 0",
+        params![workspace_id],
+    )?;
+    conn.execute(
         "UPDATE symbols
-         SET callsite_count = (
-             SELECT COUNT(*) FROM call_edges
-             WHERE call_edges.workspace_id = symbols.workspace_id
-               AND call_edges.callee_name = symbols.name
-         )
-         WHERE symbols.workspace_id = ?1",
+         SET callsite_count = c.cnt
+         FROM (
+             SELECT callee_name, COUNT(*) AS cnt FROM call_edges
+             WHERE workspace_id = ?1
+             GROUP BY callee_name
+         ) AS c
+         WHERE symbols.workspace_id = ?1 AND symbols.name = c.callee_name",
         params![workspace_id],
     )?;
     Ok(())
@@ -271,23 +282,34 @@ pub fn update_callsite_counts_for_names(
     let all: Vec<&String> = names.iter().collect();
     for chunk in all.chunks(MAX_IN_CLAUSE) {
         let placeholders: Vec<String> = (2..2 + chunk.len()).map(|i| format!("?{i}")).collect();
-        let sql = format!(
-            "UPDATE symbols
-             SET callsite_count = (
-                 SELECT COUNT(*) FROM call_edges
-                 WHERE call_edges.workspace_id = symbols.workspace_id
-                   AND call_edges.callee_name = symbols.name
-             )
-             WHERE symbols.workspace_id = ?1 AND symbols.name IN ({})",
-            placeholders.join(", ")
-        );
+        let in_list = placeholders.join(", ");
         let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(chunk.len() + 1);
         param_values.push(Box::new(workspace_id.to_owned()));
         for name in chunk {
             param_values.push(Box::new((*name).clone()));
         }
         let refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
-        conn.execute(&sql, refs.as_slice())?;
+        // Once per name, not per symbol — see `update_callsite_counts`.
+        conn.execute(
+            &format!(
+                "UPDATE symbols SET callsite_count = 0
+                 WHERE workspace_id = ?1 AND name IN ({in_list}) AND callsite_count <> 0"
+            ),
+            refs.as_slice(),
+        )?;
+        conn.execute(
+            &format!(
+                "UPDATE symbols
+                 SET callsite_count = c.cnt
+                 FROM (
+                     SELECT callee_name, COUNT(*) AS cnt FROM call_edges
+                     WHERE workspace_id = ?1 AND callee_name IN ({in_list})
+                     GROUP BY callee_name
+                 ) AS c
+                 WHERE symbols.workspace_id = ?1 AND symbols.name = c.callee_name"
+            ),
+            refs.as_slice(),
+        )?;
     }
     Ok(())
 }
@@ -542,3 +564,71 @@ pub fn delete_specific_files(
     Ok(removed)
 }
 
+
+#[cfg(test)]
+mod callsite_count_tests {
+    use super::*;
+    use crate::storage::migrations::legacy_schema_migrations;
+    use crate::storage::MigrationRunner;
+
+    fn db_with(names: &[(&str, usize)], edges: &[(&str, usize)]) -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        MigrationRunner::new(legacy_schema_migrations()).run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO file_records (workspace_id, file_path, mtime, size, symbol_count) VALUES ('ws', 'a.rs', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        for (name, n) in names {
+            for i in 0..*n {
+                conn.execute(
+                    "INSERT INTO symbols (workspace_id, file_path, name, kind, visibility, line, col)
+                     VALUES ('ws', 'a.rs', ?1, 'fn', 'pub', ?2, 0)",
+                    params![name, i as i64],
+                )
+                .unwrap();
+            }
+        }
+        for (callee, n) in edges {
+            for i in 0..*n {
+                conn.execute(
+                    "INSERT INTO call_edges (workspace_id, caller_file, callee_name, line) VALUES ('ws', 'a.rs', ?1, ?2)",
+                    params![callee, i as i64],
+                )
+                .unwrap();
+            }
+        }
+        conn
+    }
+
+    fn counts(conn: &Connection, name: &str) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT callsite_count FROM symbols WHERE workspace_id = 'ws' AND name = ?1")
+            .unwrap();
+        stmt.query_map(params![name], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn full_recompute_counts_once_per_name_for_every_same_named_symbol() {
+        let conn = db_with(&[("new", 300), ("lonely", 2)], &[("new", 50)]);
+        update_callsite_counts(&conn, "ws").unwrap();
+        assert_eq!(counts(&conn, "new"), vec![50], "all 300 `new` symbols carry the name's edge count");
+        assert_eq!(counts(&conn, "lonely"), vec![0], "a name with no edges is zero, not left stale");
+    }
+
+    #[test]
+    fn scoped_recompute_updates_only_the_named_set_and_zeroes_removed_callers() {
+        let conn = db_with(&[("new", 300), ("other", 3)], &[("new", 50), ("other", 7)]);
+        update_callsite_counts(&conn, "ws").unwrap();
+        conn.execute("DELETE FROM call_edges WHERE callee_name = 'new'", []).unwrap();
+        conn.execute(
+            "INSERT INTO call_edges (workspace_id, caller_file, callee_name, line) VALUES ('ws', 'a.rs', 'other', 99)",
+            [],
+        )
+        .unwrap();
+        let only_new: HashSet<String> = ["new".to_string()].into_iter().collect();
+        update_callsite_counts_for_names(&conn, "ws", &only_new).unwrap();
+        assert_eq!(counts(&conn, "new"), vec![0], "every caller of `new` removed → zero");
+        assert_eq!(counts(&conn, "other"), vec![7], "names outside the touched set are left alone");
+    }
+}
