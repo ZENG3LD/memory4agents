@@ -74,120 +74,122 @@ pub fn get_symbols_in_file(
     Ok(symbols)
 }
 
+/// Cap on the number of callers a single [`get_callers_of`] call
+/// materializes. A legitimate low-definition-count name can still be
+/// called from thousands of sites (e.g. a widely used helper) — this keeps
+/// one read bounded regardless. Names with an unusually large *definition*
+/// count are refused entirely before ever reaching this function — see
+/// `server::routes::ast::AMBIGUOUS_DEFINITION_THRESHOLD`.
+const MAX_CALLERS: i64 = 1000;
+
 /// Get all symbols that call a given callee name.
 ///
-/// Uses `caller_symbol_id` for precise symbol lookup when it is set (non-zero).
-/// For legacy rows where `caller_symbol_id = 0`, falls back to a file-level
-/// match but returns only the first symbol in that file rather than all of
-/// them (to avoid the original bug of returning every symbol in a file).
+/// Two `JOIN`-based queries, not one row-fetch per matching `call_edges`
+/// row: a common bare name can have well over 100k call sites (measured:
+/// `"new"` has ~139k distinct callers in the live `nemo` workspace), and
+/// the former per-edge uncached `conn.prepare` + round trip was the
+/// dominant cost behind `/ast/callers`'s multi-minute hangs (2026-09-24
+/// read-path audit).
+///
+/// - The precise branch (`caller_symbol_id != 0` — the normal case since
+///   `index::indexer::resolve_caller_id` resolves an enclosing symbol for
+///   almost every call site) joins `call_edges` straight into `symbols` by
+///   id in one query instead of one `SELECT ... WHERE id = ?` per edge.
+/// - The legacy fallback (`caller_symbol_id = 0` — a call site outside any
+///   resolved enclosing symbol; ~750 rows total in the live DB) still needs
+///   "the first symbol in that file by line" per distinct caller file, now
+///   computed once via a window function instead of once per edge.
+///
+/// Results are capped at [`MAX_CALLERS`] (SQL-level `LIMIT`, not a
+/// post-hoc truncation of an already-materialized `Vec`).
 pub fn get_callers_of(
     conn: &Connection,
     callee_name: &str,
     workspace_id: Option<&str>,
 ) -> Result<Vec<Symbol>, CoreError> {
-    // Step 1: fetch all edges for the callee.
-    let edges: Vec<(i64, String, String)> = match workspace_id {
-        Some(ws) => {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT caller_symbol_id, caller_file, workspace_id
-                 FROM call_edges
-                 WHERE callee_name = ?1 AND workspace_id = ?2",
-            )?;
-            let rows: Vec<(i64, String, String)> = stmt
-                .query_map(params![callee_name, ws], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-                })?
-                .filter_map(|r| match r {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
-                None
-            }
-        })
-                .collect();
-            rows
-        }
-        None => {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT caller_symbol_id, caller_file, workspace_id
-                 FROM call_edges
-                 WHERE callee_name = ?1",
-            )?;
-            let rows: Vec<(i64, String, String)> = stmt
-                .query_map(params![callee_name], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-                })?
-                .filter_map(|r| match r {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
-                None
-            }
-        })
-                .collect();
-            rows
-        }
-    };
-
-    // Step 2: for each edge resolve the symbol.
     let mut results: Vec<Symbol> = Vec::new();
     let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-    for (symbol_id, caller_file, ws_id) in edges {
-        if symbol_id != 0 {
-            // Precise lookup by id.
+    match workspace_id {
+        Some(ws) => {
             let mut stmt = conn.prepare(
-                "SELECT id, workspace_id, file_path, name, kind, visibility,
-                        line, col, parent_name, signature, body_hash, shape_fingerprint,
-                        shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
-                 FROM symbols WHERE id = ?1",
+                "SELECT s.id, s.workspace_id, s.file_path, s.name, s.kind, s.visibility, s.line, s.col, s.parent_name, s.signature, s.body_hash, s.shape_fingerprint, s.shape_fingerprint_loose, s.field_count, s.shape_summary, s.callsite_count, s.type_use_count, s.impl_trait
+                 FROM (SELECT DISTINCT caller_symbol_id FROM call_edges WHERE callee_name = ?1 AND workspace_id = ?2 AND caller_symbol_id != 0) e
+                 JOIN symbols s ON s.id = e.caller_symbol_id
+                 LIMIT ?3",
             )?;
-            let sym = stmt
-                .query_map(params![symbol_id], row_to_symbol)?
-                .filter_map(|r| match r {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
-                None
-            }
-        })
-                .next();
-            if let Some(s) = sym {
-                if seen_ids.insert(s.id) {
-                    results.push(s);
-                }
-            }
-        } else {
-            // Legacy fallback: return only the first symbol in caller_file so
-            // we don't inflate results with every symbol in the file.
+            collect_caller_rows(stmt.query_map(params![callee_name, ws, MAX_CALLERS], row_to_symbol)?, &mut seen_ids, &mut results);
+        }
+        None => {
             let mut stmt = conn.prepare(
-                "SELECT id, workspace_id, file_path, name, kind, visibility,
-                        line, col, parent_name, signature, body_hash, shape_fingerprint,
-                        shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
-                 FROM symbols
-                 WHERE workspace_id = ?1 AND file_path = ?2
-                 ORDER BY line ASC
-                 LIMIT 1",
+                "SELECT s.id, s.workspace_id, s.file_path, s.name, s.kind, s.visibility, s.line, s.col, s.parent_name, s.signature, s.body_hash, s.shape_fingerprint, s.shape_fingerprint_loose, s.field_count, s.shape_summary, s.callsite_count, s.type_use_count, s.impl_trait
+                 FROM (SELECT DISTINCT caller_symbol_id FROM call_edges WHERE callee_name = ?1 AND caller_symbol_id != 0) e
+                 JOIN symbols s ON s.id = e.caller_symbol_id
+                 LIMIT ?2",
             )?;
-            let sym = stmt
-                .query_map(params![ws_id, caller_file], row_to_symbol)?
-                .filter_map(|r| match r {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
-                None
-            }
-        })
-                .next();
-            if let Some(s) = sym {
-                if seen_ids.insert(s.id) {
-                    results.push(s);
-                }
-            }
+            collect_caller_rows(stmt.query_map(params![callee_name, MAX_CALLERS], row_to_symbol)?, &mut seen_ids, &mut results);
+        }
+    }
+
+    let remaining = MAX_CALLERS - results.len() as i64;
+    if remaining <= 0 {
+        return Ok(results);
+    }
+
+    match workspace_id {
+        Some(ws) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
+                 FROM (
+                     SELECT s.id, s.workspace_id, s.file_path, s.name, s.kind, s.visibility, s.line, s.col, s.parent_name, s.signature, s.body_hash, s.shape_fingerprint, s.shape_fingerprint_loose, s.field_count, s.shape_summary, s.callsite_count, s.type_use_count, s.impl_trait,
+                            ROW_NUMBER() OVER (PARTITION BY s.workspace_id, s.file_path ORDER BY s.line ASC) AS rn
+                     FROM symbols s
+                     JOIN (SELECT DISTINCT workspace_id, caller_file FROM call_edges WHERE callee_name = ?1 AND workspace_id = ?2 AND caller_symbol_id = 0) e
+                       ON e.workspace_id = s.workspace_id AND e.caller_file = s.file_path
+                 ) ranked
+                 WHERE rn = 1
+                 LIMIT ?3",
+            )?;
+            collect_caller_rows(stmt.query_map(params![callee_name, ws, remaining], row_to_symbol)?, &mut seen_ids, &mut results);
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT id, workspace_id, file_path, name, kind, visibility, line, col, parent_name, signature, body_hash, shape_fingerprint, shape_fingerprint_loose, field_count, shape_summary, callsite_count, type_use_count, impl_trait
+                 FROM (
+                     SELECT s.id, s.workspace_id, s.file_path, s.name, s.kind, s.visibility, s.line, s.col, s.parent_name, s.signature, s.body_hash, s.shape_fingerprint, s.shape_fingerprint_loose, s.field_count, s.shape_summary, s.callsite_count, s.type_use_count, s.impl_trait,
+                            ROW_NUMBER() OVER (PARTITION BY s.workspace_id, s.file_path ORDER BY s.line ASC) AS rn
+                     FROM symbols s
+                     JOIN (SELECT DISTINCT workspace_id, caller_file FROM call_edges WHERE callee_name = ?1 AND caller_symbol_id = 0) e
+                       ON e.workspace_id = s.workspace_id AND e.caller_file = s.file_path
+                 ) ranked
+                 WHERE rn = 1
+                 LIMIT ?2",
+            )?;
+            collect_caller_rows(stmt.query_map(params![callee_name, remaining], row_to_symbol)?, &mut seen_ids, &mut results);
         }
     }
 
     Ok(results)
+}
+
+/// Drains a `query_map` iterator of [`Symbol`] rows into `results`,
+/// deduplicating by id and logging (not failing) an individual row error —
+/// shared by both branches of [`get_callers_of`].
+fn collect_caller_rows(
+    rows: impl Iterator<Item = rusqlite::Result<Symbol>>,
+    seen_ids: &mut std::collections::HashSet<i64>,
+    results: &mut Vec<Symbol>,
+) {
+    for r in rows {
+        match r {
+            Ok(s) => {
+                if seen_ids.insert(s.id) {
+                    results.push(s);
+                }
+            }
+            Err(e) => tracing::warn!("[dig2memory] row read error: {e}"),
+        }
+    }
 }
 
 /// Get all file edges originating from a file.
