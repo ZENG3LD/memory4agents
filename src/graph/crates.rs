@@ -240,7 +240,7 @@ mod tests {
         );
 
         let mut conn = Connection::open_in_memory().expect("in-memory connection opens");
-        crate::storage::MigrationRunner::new(crate::storage::migrations::legacy_schema_migrations())
+        mcp_service4agent::storage::MigrationRunner::new(crate::db::legacy_schema::legacy_schema_migrations())
             .run(&mut conn)
             .expect("legacy schema migrations apply to a fresh in-memory db");
 

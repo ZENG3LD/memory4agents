@@ -7,7 +7,6 @@ pub mod model;
 pub(crate) mod proc;
 pub mod search;
 pub mod server;
-pub mod storage;
 pub mod types;
 pub mod watch;
 

@@ -79,7 +79,7 @@ impl RemovedFileRefs {
 ///
 /// Load-bearing, not cosmetic: unlike `symbols` (which cascades off
 /// `file_records` via its own `FOREIGN KEY ... ON DELETE CASCADE` —
-/// `storage::migrations::BASE_TABLES_SQL`), neither `call_edges` nor
+/// `db::legacy_schema`'s own base-tables SQL), neither `call_edges` nor
 /// `type_use_edges` carries a foreign key at all. Before this fix,
 /// [`delete_stale_files`]/[`delete_specific_files`] relied only on that
 /// cascade and never touched `call_edges`/`type_use_edges` for a file
@@ -568,8 +568,8 @@ pub fn delete_specific_files(
 #[cfg(test)]
 mod callsite_count_tests {
     use super::*;
-    use crate::storage::migrations::legacy_schema_migrations;
-    use crate::storage::MigrationRunner;
+    use crate::db::legacy_schema::legacy_schema_migrations;
+    use mcp_service4agent::storage::MigrationRunner;
 
     fn db_with(names: &[(&str, usize)], edges: &[(&str, usize)]) -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();

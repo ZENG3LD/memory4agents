@@ -2,7 +2,7 @@ use crate::ast::{registry, symbols as sym_extractor};
 use crate::db::writer;
 use crate::error::CoreError;
 use crate::graph::crates::parse_multi_manifest_workspace;
-use crate::storage::{BatchWriter, DbPool};
+use mcp_service4agent::storage::{BatchWriter, ReadPool};
 use crate::types::{
     CallEdge, FileRecord, IndexRequest, IndexResult, PendingTypeUse, Symbol, SymbolKind,
     TypeUseEdge, Workspace,
@@ -82,8 +82,8 @@ enum IndexScope {
 
 /// Incremental workspace indexer supporting multiple languages.
 ///
-/// Reads go through [`DbPool`] (no contention with any other route); writes
-/// are enqueued on [`BatchWriter`] one [`crate::storage::WriteOp`] per file,
+/// Reads go through [`ReadPool`] (no contention with any other route); writes
+/// are enqueued on [`BatchWriter`] one [`mcp_service4agent::storage::WriteOp`] per file,
 /// so a single file's failure rolls back under its own `SAVEPOINT` without
 /// losing the rest of the batch. `barrier_async` marks the points where a
 /// later phase needs everything before it durably committed — see the
@@ -106,7 +106,7 @@ impl Indexer {
     /// inside `spawn_blocking`; this function itself never blocks a tokio
     /// worker thread.
     pub async fn run(
-        reader_pool: &DbPool,
+        reader_pool: &ReadPool,
         writer_handle: &BatchWriter,
         req: &IndexRequest,
     ) -> Result<IndexResult, CoreError> {
@@ -118,7 +118,7 @@ impl Indexer {
     /// pay for a full ~24k-file disk walk or a `cargo metadata` subprocess
     /// per submodule. See [`IndexScope::Paths`] for the exact semantics.
     pub async fn run_changed_paths(
-        reader_pool: &DbPool,
+        reader_pool: &ReadPool,
         writer_handle: &BatchWriter,
         req: &IndexRequest,
         changed_paths: Vec<PathBuf>,
@@ -127,7 +127,7 @@ impl Indexer {
     }
 
     async fn run_scoped(
-        reader_pool: &DbPool,
+        reader_pool: &ReadPool,
         writer_handle: &BatchWriter,
         req: &IndexRequest,
         scope: IndexScope,
@@ -1047,12 +1047,12 @@ mod tests {
     }
 
     use crate::index::lock::IndexLocks;
-    use crate::storage::{BatchConfig, Db, DbConfig, MigrationRunner};
+    use mcp_service4agent::storage::{BatchConfig, Db, DbConfig, MigrationRunner, ReadPoolConfig};
     use std::io::Write as _;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
 
-    async fn test_writer_and_pool(tag: &str) -> (Db, BatchWriter, DbPool, PathBuf) {
+    async fn test_writer_and_pool(tag: &str) -> (Db, BatchWriter, ReadPool, PathBuf) {
         let mut path = std::env::temp_dir();
         path.push(format!(
             "m4a-indexer-{tag}-{}-{}",
@@ -1065,11 +1065,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let db = Db::open(&DbConfig::new(&path)).expect("writer db opens");
-        db.run_migrations(MigrationRunner::new(crate::storage::migrations::legacy_schema_migrations()))
+        db.run_migrations(MigrationRunner::new(crate::db::legacy_schema::legacy_schema_migrations()))
             .await
             .expect("migration applies");
 
-        let reader_pool = DbPool::open_with_size(&DbConfig::new(&path), 4).expect("pool opens");
+        let reader_pool = ReadPoolConfig::new(&path).pool_size(4).open().expect("pool opens");
         let writer = BatchWriter::new(db.clone(), BatchConfig::default());
         (db, writer, reader_pool, path)
     }
@@ -1332,6 +1332,10 @@ mod tests {
     #[tokio::test]
     async fn concurrent_runs_for_the_same_workspace_never_interleave_under_the_shared_lock() {
         let (db, writer, reader_pool, db_path) = test_writer_and_pool("single-flight").await;
+        // `ReadPool` isn't `Clone` (unlike the retired `DbPool`) — wrapped
+        // here so both concurrently-spawned tasks below can share one pool
+        // via a cheap `Arc` clone instead of each needing their own.
+        let reader_pool = Arc::new(reader_pool);
         let locks = IndexLocks::new();
 
         let mut root = std::env::temp_dir();
@@ -1415,7 +1419,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    async fn read_callsite_count(reader_pool: &DbPool, workspace_id: &str, name: &str) -> i64 {
+    async fn read_callsite_count(reader_pool: &ReadPool, workspace_id: &str, name: &str) -> i64 {
         let wid = workspace_id.to_string();
         let name = name.to_string();
         reader_pool

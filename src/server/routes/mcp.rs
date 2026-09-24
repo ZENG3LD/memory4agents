@@ -610,7 +610,7 @@ mod tests {
     use crate::index::lock::IndexLocks;
     use crate::server::state::AppState;
     use crate::server::stats::StatsCache;
-    use crate::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool, MigrationRunner};
+    use mcp_service4agent::storage::{BatchConfig, BatchWriter, Db, DbConfig, MigrationRunner, ReadPoolConfig};
     use crate::types::{CallEdge, FileRecord, Symbol, SymbolKind, Visibility};
 
     /// L5's own gate: at most 8 tools, `tools/list` at most 8 KB, no tool
@@ -679,7 +679,7 @@ mod tests {
     async fn fixture_state() -> (SharedState, std::path::PathBuf) {
         let path = temp_db_path("fixture");
         let db = Db::open(&DbConfig::new(&path)).expect("writer db opens");
-        db.run_migrations(MigrationRunner::new(crate::storage::migrations::legacy_schema_migrations()))
+        db.run_migrations(MigrationRunner::new(crate::db::legacy_schema::legacy_schema_migrations()))
             .await
             .expect("migration applies");
 
@@ -705,7 +705,7 @@ mod tests {
         .expect("join")
         .expect("seed writes succeed");
 
-        let reader_pool = DbPool::open_with_size(&DbConfig::new(&path), 4).expect("reader pool opens");
+        let reader_pool = ReadPoolConfig::new(&path).pool_size(4).open().expect("reader pool opens");
         let writer_handle = BatchWriter::new(db, BatchConfig::default());
         let read_model = crate::model::ReadModel::new();
         crate::model::read_model::build_and_set(&reader_pool, &read_model, "ws")
@@ -715,6 +715,7 @@ mod tests {
             storage: crate::server::state::Storage::ready(writer_handle, reader_pool),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+            checkpoint_cache: Arc::new(RwLock::new(crate::server::checkpoint::CheckpointCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
             read_model,

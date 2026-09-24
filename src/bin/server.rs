@@ -1,8 +1,10 @@
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
+use memory4agent::db::legacy_schema::legacy_schema_migrations;
 use memory4agent::index::lock::IndexLocks;
 use memory4agent::model::ReadModel;
+use memory4agent::server::checkpoint::{spawn_checkpoint_task, CheckpointCache};
 use memory4agent::server::config::Config;
 #[cfg(feature = "nemo")]
 use memory4agent::server::registration;
@@ -10,10 +12,20 @@ use memory4agent::server::startup::{run_migrations_and_build_snapshots, StartupS
 use memory4agent::server::state::{AppState, SharedState, Storage};
 use memory4agent::server::stats::{spawn_stats_refresher, StatsCache};
 use memory4agent::server::routes;
-use memory4agent::storage::migrations::legacy_schema_migrations;
-use memory4agent::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool, MigrationRunner};
+use mcp_service4agent::storage::{BatchConfig, BatchWriter, Checkpointer, Db, DbConfig, MigrationRunner, ReadPoolConfig};
 #[cfg(feature = "nemo")]
 use mcp_service4agent::register;
+
+/// Total page-cache budget the reader pool spends across all its
+/// connections — see `mcp_service4agent::storage::ReadPoolConfig`.
+const READER_POOL_CACHE_BUDGET_KIB: i64 = 256 * 1024;
+
+/// Default per-call read deadline for reads through the reader pool
+/// (`server::state::with_db` and every route built on it) — shorter than
+/// the crate's own library default (30s) since this pool serves interactive
+/// HTTP/MCP routes. The read-model snapshot build overrides this per-call
+/// with its own much longer deadline — see `model::read_model::build_and_set`.
+const READER_POOL_DEFAULT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() {
@@ -36,6 +48,7 @@ async fn main() {
         storage: std::sync::OnceLock::new(),
         data_dir: config.data_dir.clone(),
         stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+        checkpoint_cache: Arc::new(RwLock::new(CheckpointCache::empty())),
         index_locks: IndexLocks::new(),
         last_index: Arc::new(RwLock::new(None)),
         read_model: ReadModel::new(),
@@ -72,15 +85,27 @@ async fn main() {
     // `StartupPhase::Ready` — see `server::startup`.
     let startup_state = state.clone();
     let reader_pool_size = config.reader_pool_size;
+    let wal_path = std::path::PathBuf::from(format!("{db_path}-wal"));
     tokio::spawn(async move {
         let opened = tokio::task::spawn_blocking(move || {
             let db = Db::open(&DbConfig::new(&db_path)).map_err(|e| format!("writer db: {e}"))?;
-            let pool = DbPool::open_with_size(&DbConfig::new(&db_path), reader_pool_size)
+            let pool = ReadPoolConfig::new(&db_path)
+                .pool_size(reader_pool_size)
+                .total_cache_budget_kib(READER_POOL_CACHE_BUDGET_KIB)
+                .default_read_deadline(READER_POOL_DEFAULT_DEADLINE)
+                .open()
                 .map_err(|e| format!("reader pool: {e}"))?;
-            Ok::<_, String>((db, pool))
+            // Own dedicated connection for `PRAGMA wal_checkpoint` — off
+            // `BatchWriter`'s queue and off the reader pool entirely (see
+            // `server::checkpoint`'s own module doc). Sized with the SAME
+            // per-connection cache share the reader pool computed for
+            // itself, rather than a second, independent constant.
+            let checkpointer = Checkpointer::open(&db_path, pool.per_connection_cache_kib())
+                .map_err(|e| format!("checkpointer: {e}"))?;
+            Ok::<_, String>((db, pool, checkpointer))
         })
         .await;
-        let (db, reader_pool) = match opened {
+        let (db, reader_pool, checkpointer) = match opened {
             Ok(Ok(handles)) => handles,
             Ok(Err(e)) => {
                 tracing::error!("opening the database failed: {e}");
@@ -92,11 +117,13 @@ async fn main() {
             }
         };
         let writer = BatchWriter::new(db.clone(), BatchConfig::default());
-        if startup_state.storage.set(Storage { writer, reader_pool }).is_err() {
+        if startup_state.storage.set(Storage::new(writer, reader_pool)).is_err() {
             tracing::error!("database handles were already set");
             return;
         }
         tracing::info!("database open");
+
+        spawn_checkpoint_task(startup_state.clone(), Arc::new(checkpointer), wal_path);
 
         let migrations = MigrationRunner::new(legacy_schema_migrations());
         if let Err(e) = run_migrations_and_build_snapshots(startup_state.clone(), db, migrations).await {

@@ -308,10 +308,48 @@ pub struct HealthStatus {
     /// snapshot has been built.
     #[serde(default)]
     pub snapshots: Vec<SnapshotHealth>,
+    /// Reader-pool call/slow-call/deadline-hit counts, aggregated across
+    /// every labeled read site since boot. See
+    /// `mcp_service4agent::storage::ReadPool::metrics_snapshot` and
+    /// `server::state::AppState::reader_deadline_hits`.
+    #[serde(default)]
+    pub reader_pool: ReaderPoolHealth,
+    /// Last known WAL checkpoint outcome, or `None` before the first
+    /// background attempt has run. See `server::checkpoint`.
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointHealth>,
 }
 
 fn default_phase() -> String {
     "ready".to_string()
+}
+
+/// Aggregate reader-pool health surfaced by `/health` and `mem_health` — see
+/// [`HealthStatus::reader_pool`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReaderPoolHealth {
+    /// Total labeled reads across every call site since boot.
+    pub calls: u64,
+    /// Reads that took at least the pool's own slow-query threshold.
+    pub slow_calls: u64,
+    /// Reads that were interrupted for exceeding their own deadline
+    /// (`with_db`'s hot-route path only — see
+    /// `server::state::AppState::reader_deadline_hits`).
+    pub deadline_hits: u64,
+}
+
+/// One WAL checkpoint attempt's outcome, as last recorded by
+/// `server::checkpoint`. See [`HealthStatus::checkpoint`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointHealth {
+    /// `"passive"` or `"truncate"`.
+    pub mode: String,
+    pub ok: bool,
+    pub wal_size_before_bytes: u64,
+    pub wal_size_after_bytes: u64,
+    /// Age in seconds of this outcome.
+    pub age_secs: u64,
+    pub error: Option<String>,
 }
 
 /// One workspace's read-model snapshot health, surfaced by `/health` and

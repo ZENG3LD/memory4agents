@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod config;
 #[cfg(feature = "nemo")]
 pub mod registration;

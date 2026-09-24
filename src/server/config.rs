@@ -1,14 +1,14 @@
 /// Reader-pool size default when `MEMORY4AGENT_READER_POOL_SIZE` is unset or
-/// unparsable. See `crate::storage::pool::DbPool`.
+/// unparsable. See `mcp_service4agent::storage::ReadPool`.
 const DEFAULT_READER_POOL_SIZE: usize = 8;
 
 pub struct Config {
     pub port: u16,
     pub data_dir: String,
-    /// Number of concurrent read-only connections `crate::storage::DbPool`
+    /// Number of concurrent read-only connections `mcp_service4agent::storage::ReadPool`
     /// opens. Every HTTP/MCP read and heavy analytics route runs against
     /// this pool once `AppState` is rewired onto it (piece 0.5); it never
-    /// touches the single writer connection `crate::storage::Db`/`BatchWriter`
+    /// touches the single writer connection `mcp_service4agent::storage::Db`/`BatchWriter`
     /// own.
     pub reader_pool_size: usize,
 }

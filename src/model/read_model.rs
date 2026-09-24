@@ -4,11 +4,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::time::Duration;
 
 use crate::model::snapshot::{Snapshot, SnapshotStats};
 use crate::server::state::SharedState;
-use crate::storage::DbPool;
+use mcp_service4agent::storage::ReadPool;
 use crate::CoreError;
+
+/// Deadline [`build_and_set`] uses for the whole sequential snapshot build,
+/// overriding [`ReadPool`]'s own (much shorter) pool-wide default — see that
+/// function's own doc for why.
+const SNAPSHOT_BUILD_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
 /// Single-flight + coalescing bookkeeping for [`ReadModel::request_rebuild`]
 /// — one combined mutex (not two separate ones) so a "decide whether to
@@ -78,16 +84,30 @@ impl ReadModel {
 
 }
 
-/// Builds one workspace's snapshot off the request path (`spawn_blocking`
-/// around the sequential SQLite read pass, over one connection checked out
-/// for the whole build) and swaps it into `read_model`. `pub(crate)` (not
-/// private) so route test fixtures elsewhere in the crate (`ast`, `graph`,
-/// `mcp`) can build a snapshot for their seeded data without going through
-/// the fire-and-forget [`request_rebuild`].
-pub(crate) async fn build_and_set(reader_pool: &DbPool, read_model: &ReadModel, workspace_id: &str) -> Result<(), CoreError> {
-    let guard = reader_pool.acquire().await.map_err(CoreError::Storage)?;
+/// Builds one workspace's snapshot off the request path (one connection
+/// checked out of `reader_pool` for the whole sequential SQLite read pass)
+/// and swaps it into `read_model`. `pub(crate)` (not private) so route test
+/// fixtures elsewhere in the crate (`ast`, `graph`, `mcp`) can build a
+/// snapshot for their seeded data without going through the fire-and-forget
+/// [`request_rebuild`].
+///
+/// Runs via [`ReadPool::read_with_deadline`] with an explicit
+/// [`SNAPSHOT_BUILD_DEADLINE`] (15 minutes) rather than the pool's own
+/// (much shorter — 10s in production, see `bin/server.rs`) default: this is
+/// a long sequential read over the whole workspace, not a point lookup, and
+/// must never be cut short by a deadline sized for the hot analytics routes
+/// that share this same pool. `Snapshot::build` returns `CoreError`, not
+/// `rusqlite::Error`, so the closure wraps it in `Ok(..)` to satisfy
+/// `read_with_deadline`'s own `rusqlite::Result<T>` contract — flattened
+/// right after.
+pub(crate) async fn build_and_set(reader_pool: &ReadPool, read_model: &ReadModel, workspace_id: &str) -> Result<(), CoreError> {
     let wid = workspace_id.to_string();
-    let snapshot = tokio::task::spawn_blocking(move || Snapshot::build(&guard, &wid)).await??;
+    let snapshot = reader_pool
+        .read_with_deadline("read_model_snapshot_build", SNAPSHOT_BUILD_DEADLINE, move |conn| {
+            Ok(Snapshot::build(conn, &wid))
+        })
+        .await
+        .map_err(CoreError::Storage)??;
     let stats = snapshot.stats();
     tracing::info!(
         workspace_id,
@@ -105,7 +125,7 @@ pub(crate) async fn build_and_set(reader_pool: &DbPool, read_model: &ReadModel, 
 /// Builds the initial snapshot for every workspace row already in the
 /// database — called once at boot, after migrations, before the startup
 /// phase flips to `Ready` (see `server::startup`).
-pub async fn build_all_workspaces(reader_pool: &DbPool, read_model: &ReadModel) -> Result<(), CoreError> {
+pub async fn build_all_workspaces(reader_pool: &ReadPool, read_model: &ReadModel) -> Result<(), CoreError> {
     let ids: Vec<String> = reader_pool
         .read(|conn| {
             conn.prepare("SELECT id FROM workspaces")?
@@ -171,7 +191,8 @@ pub fn request_rebuild(state: &SharedState, workspace_id: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{BatchConfig, BatchWriter, Db, DbConfig, MigrationRunner};
+    use mcp_service4agent::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbError, MigrationRunner, ReadPoolConfig};
+    use std::time::Duration;
 
     fn temp_db_path(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -184,10 +205,10 @@ mod tests {
         p
     }
 
-    async fn seeded_pool(tag: &str) -> (DbPool, Db, BatchWriter, std::path::PathBuf) {
+    async fn seeded_pool(tag: &str) -> (ReadPool, Db, BatchWriter, std::path::PathBuf) {
         let path = temp_db_path(tag);
         let db = Db::open(&DbConfig::new(&path)).expect("writer db opens");
-        db.run_migrations(MigrationRunner::new(crate::storage::migrations::legacy_schema_migrations()))
+        db.run_migrations(MigrationRunner::new(crate::db::legacy_schema::legacy_schema_migrations()))
             .await
             .expect("migration applies");
         let write_db = db.clone();
@@ -203,9 +224,52 @@ mod tests {
         .await
         .expect("join")
         .expect("seed workspace row");
-        let reader_pool = DbPool::open_with_size(&DbConfig::new(&path), 4).expect("reader pool opens");
+        let reader_pool = ReadPoolConfig::new(&path).pool_size(4).open().expect("reader pool opens");
         let writer = BatchWriter::new(db.clone(), BatchConfig::default());
         (reader_pool, db, writer, path)
+    }
+
+    /// `build_and_set` must survive a pool-wide default deadline far too
+    /// short for even a trivial real read — proving it actually uses its
+    /// own explicit [`SNAPSHOT_BUILD_DEADLINE`] override
+    /// (`ReadPool::read_with_deadline`), not `ReadPool`'s own default. The
+    /// control assertion first proves this pool's tiny default deadline is
+    /// actually live (an ordinary slow read against the SAME pool really
+    /// does get cut short by it) — otherwise this test would prove nothing
+    /// about the override.
+    #[tokio::test]
+    async fn snapshot_build_survives_a_pool_default_deadline_too_short_for_an_ordinary_read() {
+        let (_reader_pool, db, writer, path) = seeded_pool("deadline-override").await;
+
+        // A SEPARATE pool over the same file, with a comically short default
+        // read deadline.
+        let short_deadline_pool = ReadPoolConfig::new(&path)
+            .pool_size(2)
+            .default_read_deadline(Duration::from_millis(5))
+            .open()
+            .expect("short-deadline pool opens");
+
+        let control = short_deadline_pool
+            .read(|conn| {
+                std::thread::sleep(Duration::from_millis(200));
+                conn.query_row("SELECT count(*) FROM workspaces", [], |r| r.get::<_, i64>(0))
+            })
+            .await;
+        assert!(
+            matches!(control, Err(DbError::Deadline { .. })),
+            "sanity check: a 5ms default deadline must cut an ordinary 200ms read short, got {control:?}"
+        );
+
+        let read_model = ReadModel::new();
+        build_and_set(&short_deadline_pool, &read_model, "ws")
+            .await
+            .expect("the snapshot build must survive the tiny pool default via its own explicit override");
+        assert!(read_model.get("ws").is_some(), "workspace 'ws' must be loaded despite the tiny pool default deadline");
+
+        drop(short_deadline_pool);
+        drop(writer);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

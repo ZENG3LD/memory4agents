@@ -20,9 +20,10 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
+use crate::db::legacy_schema::seed_legacy_versions_if_needed;
 use crate::server::state::SharedState;
-use crate::storage::migrations::{seed_legacy_versions_if_needed, MigrationRunner};
-use crate::storage::Db;
+use mcp_service4agent::storage::Db;
+use mcp_service4agent::storage::MigrationRunner;
 use crate::CoreError;
 
 /// One phase in the boot sequence, in the order the server passes through
@@ -140,7 +141,7 @@ mod tests {
     use crate::server::routes::health::health_snapshot;
     use crate::server::state::AppState;
     use crate::server::stats::StatsCache;
-    use crate::storage::{BatchConfig, BatchWriter, DbConfig, DbPool, Migration};
+    use mcp_service4agent::storage::{BatchConfig, BatchWriter, DbConfig, Migration, ReadPoolConfig};
     use std::sync::RwLock;
     use std::time::{Duration, Instant};
 
@@ -167,7 +168,7 @@ mod tests {
     async fn health_answers_and_reports_phase_while_a_slow_migration_holds_the_writer() {
         let path = temp_db_path("slow-migration");
         let db = Db::open(&DbConfig::new(&path)).expect("writer db opens");
-        let reader_pool = DbPool::open_with_size(&DbConfig::new(&path), 4).expect("reader pool opens");
+        let reader_pool = ReadPoolConfig::new(&path).pool_size(4).open().expect("reader pool opens");
         let writer = BatchWriter::new(db.clone(), BatchConfig::default());
 
         let startup = StartupState::new();
@@ -177,6 +178,7 @@ mod tests {
             storage: crate::server::state::Storage::ready(writer, reader_pool),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+            checkpoint_cache: Arc::new(RwLock::new(crate::server::checkpoint::CheckpointCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
             read_model: ReadModel::new(),
@@ -220,7 +222,7 @@ mod tests {
     async fn run_migrations_and_build_snapshots_reaches_ready_and_loads_workspaces() {
         let path = temp_db_path("full-sequence");
         let db = Db::open(&DbConfig::new(&path)).expect("writer db opens");
-        let reader_pool = DbPool::open_with_size(&DbConfig::new(&path), 4).expect("reader pool opens");
+        let reader_pool = ReadPoolConfig::new(&path).pool_size(4).open().expect("reader pool opens");
         let writer = BatchWriter::new(db.clone(), BatchConfig::default());
         let startup = StartupState::new();
 
@@ -228,6 +230,7 @@ mod tests {
             storage: crate::server::state::Storage::ready(writer, reader_pool),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+            checkpoint_cache: Arc::new(RwLock::new(crate::server::checkpoint::CheckpointCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
             read_model: ReadModel::new(),
@@ -238,7 +241,7 @@ mod tests {
         // scans have real tables to query) plus one extra migration that
         // seeds a workspace row — by the time it runs, `workspaces` already
         // exists (created by `legacy_schema_migrations`'s own v1).
-        let mut migration_list = crate::storage::migrations::legacy_schema_migrations();
+        let mut migration_list = crate::db::legacy_schema::legacy_schema_migrations();
         migration_list.push(Migration::new(
             9,
             "seed_workspace",

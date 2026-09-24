@@ -22,7 +22,7 @@ pub enum CoreError {
     WorkspaceNotFound { id: String },
 
     #[error("storage error: {0}")]
-    Storage(#[from] crate::storage::DbError),
+    Storage(#[from] mcp_service4agent::storage::DbError),
 
     #[error("background task join error: {0}")]
     Join(#[from] tokio::task::JoinError),

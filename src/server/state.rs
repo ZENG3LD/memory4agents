@@ -1,12 +1,14 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use axum::response::{IntoResponse, Response};
 use axum::http::StatusCode;
 use crate::index::job::IndexJobStatus;
 use crate::index::lock::IndexLocks;
 use crate::model::{ReadModel, Snapshot};
+use crate::server::checkpoint::CheckpointCache;
 use crate::server::startup::{StartupPhase, StartupState};
 use crate::server::stats::StatsCache;
-use crate::storage::{BatchWriter, DbPool};
+use mcp_service4agent::storage::{BatchWriter, DbError, ReadPool};
 use crate::CoreError;
 
 /// Every HTTP/MCP read (including every heavy analytics route in
@@ -20,14 +22,39 @@ use crate::CoreError;
 /// replays a large WAL on first open) and must not keep `/health` down.
 pub struct Storage {
     pub writer: BatchWriter,
-    pub reader_pool: DbPool,
+    /// `Arc`-wrapped: unlike the retired `DbPool` (internally `Arc<PoolInner>`
+    /// and cheaply `Clone`), `mcp_service4agent::storage::ReadPool` is a
+    /// plain, non-`Clone` struct — callers that need an owned, `'static`
+    /// handle to move into a spawned task (`model::read_model::request_rebuild`,
+    /// `server::routes::health`'s own test) share this `Arc` instead.
+    pub reader_pool: Arc<ReadPool>,
+    /// Reads through [`with_db`] that came back as
+    /// `Err(DbError::Deadline { .. })` — surfaced by `/health`/`mem_health`
+    /// alongside `reader_pool.metrics_snapshot()`'s own slow-call counts.
+    reader_deadline_hits: Arc<AtomicU64>,
 }
 
 impl Storage {
-    /// An already-open storage cell, for callers that open the database
-    /// themselves (tests, tools).
-    pub fn ready(writer: BatchWriter, reader_pool: DbPool) -> std::sync::OnceLock<Storage> {
-        std::sync::OnceLock::from(Storage { writer, reader_pool })
+    /// Constructs the storage cell directly. Used by `bin/server.rs`'s own
+    /// background startup task, which owns the `OnceLock` itself
+    /// (`AppState::storage`) and only needs the value to `.set()` into it.
+    ///
+    /// `reader_pool` accepts either a freshly-opened [`ReadPool`] (wrapped
+    /// in a new `Arc` here) or an already-`Arc`-wrapped one a caller wants
+    /// to keep its own handle to (e.g. a test that also polls the pool
+    /// directly after handing a clone to `Storage`).
+    pub fn new(writer: BatchWriter, reader_pool: impl Into<Arc<ReadPool>>) -> Storage {
+        Storage {
+            writer,
+            reader_pool: reader_pool.into(),
+            reader_deadline_hits: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// An already-open storage cell, pre-wrapped in a ready `OnceLock` — for
+    /// callers that open the database themselves (tests, tools).
+    pub fn ready(writer: BatchWriter, reader_pool: impl Into<Arc<ReadPool>>) -> std::sync::OnceLock<Storage> {
+        std::sync::OnceLock::from(Self::new(writer, reader_pool))
     }
 }
 
@@ -39,6 +66,9 @@ pub struct AppState {
     /// Last known DB stats for `/health`, refreshed by a background task.
     /// See [`crate::server::stats::spawn_stats_refresher`].
     pub stats_cache: Arc<RwLock<StatsCache>>,
+    /// Last known WAL checkpoint outcome for `/health`, refreshed by
+    /// [`crate::server::checkpoint::spawn_checkpoint_task`].
+    pub checkpoint_cache: Arc<RwLock<CheckpointCache>>,
     /// Per-workspace single-flight lock, shared by the `/index` route
     /// handler and `crate::watch`'s debounced driver — at most one
     /// `Indexer::run`/`run_changed_paths` call per workspace id at a time.
@@ -68,9 +98,20 @@ impl AppState {
         &self.opened().writer
     }
 
-    /// The reader pool. Same validity rule as [`AppState::writer`].
-    pub fn reader_pool(&self) -> &DbPool {
+    /// The reader pool. Same validity rule as [`AppState::writer`]. Returns
+    /// the `Arc` (not just `&ReadPool`) so a caller that needs an owned,
+    /// `'static` handle to move into a spawned task can `.clone()` it
+    /// cheaply — see [`Storage::reader_pool`]'s own doc for why `ReadPool`
+    /// itself isn't `Clone`.
+    pub fn reader_pool(&self) -> &Arc<ReadPool> {
         &self.opened().reader_pool
+    }
+
+    /// Reads through [`with_db`] that hit their deadline, so far — `0`
+    /// before the database is open (nothing has read yet). See
+    /// `server::routes::health::health_snapshot`.
+    pub fn reader_deadline_hits(&self) -> u64 {
+        self.storage.get().map(|s| s.reader_deadline_hits.load(Ordering::Relaxed)).unwrap_or(0)
     }
 
     fn opened(&self) -> &Storage {
@@ -123,18 +164,24 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Runs `f` against a checked-out reader-pool connection inside
-/// `spawn_blocking`, so the connection is acquired and returned to the pool
-/// entirely on a blocking-pool thread — never held across an `.await` by the
-/// caller, and never contending with any other route or with `/index`.
+/// Runs `f` against a checked-out reader-pool connection, via
+/// [`ReadPool::read_labeled`] under the pool's own default read deadline
+/// (see `mcp_service4agent::storage::ReadPoolConfig::default_read_deadline`,
+/// wired to 10s at boot — `bin/server.rs`) — the connection is acquired and
+/// returned to the pool entirely inside the pool's own `spawn_blocking`,
+/// never held across an `.await` by the caller, and never contending with
+/// any other route or with `/index`.
 ///
 /// This is the standard way every route handler in `server::routes` touches
 /// the database; see `/ast`, `/graph`, `/usage` and `/index` routes. Unlike
 /// the retired mutex-backed implementation, checking out one of
-/// [`DbPool`]'s N connections here only ever blocks the (bounded) set of
+/// [`ReadPool`]'s N connections here only ever blocks the (bounded) set of
 /// callers that also need a reader-pool slot at the same instant — it never
 /// blocks `/health` (which never touches the database at all) and it never
-/// blocks the single writer thread `state.writer()` owns.
+/// blocks the single writer thread `state.writer()` owns. A read that
+/// outlives the pool's default deadline counts toward
+/// [`AppState::reader_deadline_hits`] — surfaced by `/health`/`mem_health`
+/// alongside `reader_pool.metrics_snapshot()`'s own slow-call counts.
 pub async fn with_db<T, F>(state: &SharedState, f: F) -> Result<T, AppError>
 where
     T: Send + 'static,
@@ -143,14 +190,20 @@ where
     if !state.startup.is_ready() {
         return Err(AppError::NotReady(state.startup.get()));
     }
-    let guard = state
+    let outcome = state
         .reader_pool()
-        .acquire()
-        .await
-        .map_err(|e| AppError::Internal(format!("reader pool: {e}")))?;
-    tokio::task::spawn_blocking(move || f(&guard))
-        .await
-        .map_err(|e| AppError::Internal(format!("task join error: {e}")))?
+        .read_labeled("with_db", None, |_: &Result<T, AppError>| 0u64, move |conn| Ok(f(conn)))
+        .await;
+    match outcome {
+        Ok(inner) => inner,
+        Err(err @ DbError::Deadline { .. }) => {
+            if let Some(storage) = state.storage.get() {
+                storage.reader_deadline_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(AppError::Internal(format!("reader pool: {err}")))
+        }
+        Err(err) => Err(AppError::Internal(format!("reader pool: {err}"))),
+    }
 }
 
 /// The read-model counterpart to [`with_db`]: returns the current snapshot
@@ -196,7 +249,7 @@ pub fn snapshots_for(state: &SharedState, workspace: Option<&str>) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{BatchConfig, Db, DbConfig, MigrationRunner};
+    use mcp_service4agent::storage::{BatchConfig, Db, DbConfig, MigrationRunner, ReadPoolConfig};
     use std::time::Duration;
 
     /// Proves the recon's #1 defect (one heavy analytics route locking every
@@ -219,7 +272,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let db = Db::open(&DbConfig::new(&path)).expect("writer db opens");
-        db.run_migrations(MigrationRunner::new(vec![crate::storage::Migration::new(
+        db.run_migrations(MigrationRunner::new(vec![mcp_service4agent::storage::Migration::new(
             1,
             "t",
             "CREATE TABLE t (n INTEGER PRIMARY KEY);",
@@ -227,12 +280,13 @@ mod tests {
         .await
         .expect("migration applies");
 
-        let reader_pool = DbPool::open_with_size(&DbConfig::new(&path), 4).expect("pool opens");
+        let reader_pool = ReadPoolConfig::new(&path).pool_size(4).open().expect("pool opens");
         let writer = BatchWriter::new(db.clone(), BatchConfig::default());
         let state: SharedState = Arc::new(AppState {
             storage: crate::server::state::Storage::ready(writer.clone(), reader_pool),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+            checkpoint_cache: Arc::new(RwLock::new(crate::server::checkpoint::CheckpointCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
             read_model: ReadModel::new(),

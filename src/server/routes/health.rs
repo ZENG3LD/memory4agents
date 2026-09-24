@@ -69,6 +69,25 @@ pub(crate) fn health_snapshot(state: &SharedState) -> HealthStatus {
             estimated_bytes: summary.stats.estimated_bytes,
         })
         .collect();
+    let reader_pool = state.storage.get().map(|s| s.reader_pool.metrics_snapshot()).unwrap_or_default();
+    let (pool_calls, pool_slow_calls) = reader_pool
+        .by_label
+        .iter()
+        .fold((0u64, 0u64), |(calls, slow), m| (calls + m.calls, slow + m.slow_calls));
+    let checkpoint = state
+        .checkpoint_cache
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot()
+        .map(|(outcome, age)| crate::types::CheckpointHealth {
+            mode: outcome.mode.to_string(),
+            ok: outcome.ok,
+            wal_size_before_bytes: outcome.wal_size_before_bytes,
+            wal_size_after_bytes: outcome.wal_size_after_bytes,
+            age_secs: age.as_secs(),
+            error: outcome.error,
+        });
+
     HealthStatus {
         ok: cache.ok,
         db_path,
@@ -78,6 +97,12 @@ pub(crate) fn health_snapshot(state: &SharedState) -> HealthStatus {
         stats_age_secs: cache.age_secs(),
         phase: state.startup.get().to_string(),
         snapshots,
+        reader_pool: crate::types::ReaderPoolHealth {
+            calls: pool_calls,
+            slow_calls: pool_slow_calls,
+            deadline_hits: state.reader_deadline_hits(),
+        },
+        checkpoint,
     }
 }
 
@@ -130,14 +155,11 @@ async fn ready_probe(state: &SharedState) -> Result<(), String> {
     if state.storage.get().is_none() {
         return Err(format!("database not open yet (phase {:?})", state.startup.get()));
     }
-    let guard = state.reader_pool().acquire().await.map_err(|e| e.to_string())?;
-    tokio::task::spawn_blocking(move || {
-        guard
-            .query_row("SELECT 1", [], |_row| Ok(()))
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    state
+        .reader_pool()
+        .read_labeled("ready_probe", None, |_: &()| 0u64, |conn| conn.query_row("SELECT 1", [], |_row| Ok(())))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -148,23 +170,41 @@ mod tests {
     use crate::server::startup::StartupState;
     use crate::server::state::{with_db, AppError, AppState};
     use crate::server::stats::StatsCache;
-    use crate::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool};
+    use mcp_service4agent::storage::{BatchConfig, BatchWriter, Db, DbConfig, ReadPoolConfig};
     use std::sync::{Arc, RwLock};
     use std::time::Instant;
 
-    fn test_state() -> SharedState {
-        let db = Db::open(&DbConfig::in_memory()).expect("in-memory writer db opens");
-        let reader_pool = DbPool::open_with_size(&DbConfig::in_memory(), 8).expect("in-memory reader pool opens");
+    /// A real file-backed pair, not `:memory:` — `ReadPool` opens N
+    /// INDEPENDENT connections to the same file (that is the whole point of
+    /// the pool), which only makes sense against a real file: an in-memory
+    /// SQLite connection is private to itself, so a second `:memory:`
+    /// connection would never see the first's schema/data at all.
+    fn test_state() -> (SharedState, std::path::PathBuf) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "m4a-health-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let db = Db::open(&DbConfig::new(&path)).expect("writer db opens");
+        let reader_pool = ReadPoolConfig::new(&path).pool_size(8).open().expect("reader pool opens");
         let writer = BatchWriter::new(db, BatchConfig::default());
-        Arc::new(AppState {
+        let state = Arc::new(AppState {
             storage: crate::server::state::Storage::ready(writer, reader_pool),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+            checkpoint_cache: Arc::new(RwLock::new(crate::server::checkpoint::CheckpointCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
             read_model: ReadModel::new(),
             startup: StartupState::ready(),
-        })
+        });
+        (state, path)
     }
 
     /// `/health` must answer instantly even while a long read holds one of
@@ -173,21 +213,22 @@ mod tests {
     /// failure mode.
     #[tokio::test]
     async fn health_answers_while_a_reader_pool_connection_is_held() {
-        let state = test_state();
+        let (state, path) = test_state();
 
         // Simulate a long-running DB read (what count_symbols used to do
-        // over the 2.7GB on-disk index) holding one pool connection.
+        // over the 2.7GB on-disk index) holding one pool connection — the
+        // whole closure (signal + sleep) runs inside `ReadPool::read`'s own
+        // `spawn_blocking`, exactly like a real slow handler's would.
         let (lock_acquired_tx, lock_acquired_rx) = tokio::sync::oneshot::channel();
         let pool = state.reader_pool().clone();
         let hold_task = tokio::spawn(async move {
-            let guard = pool.acquire().await.expect("acquire reader pool connection");
-            tokio::task::spawn_blocking(move || {
+            pool.read(move |_conn| {
                 let _ = lock_acquired_tx.send(());
                 std::thread::sleep(Duration::from_millis(1500));
-                drop(guard);
+                Ok::<(), rusqlite::Error>(())
             })
             .await
-            .expect("hold task must not panic");
+            .expect("hold read must not fail")
         });
 
         lock_acquired_rx
@@ -205,6 +246,7 @@ mod tests {
         );
 
         hold_task.await.expect("hold task must not panic");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// `/health` must stay responsive even when many concurrent "slow
@@ -217,7 +259,7 @@ mod tests {
     /// worker) must not stop `/health` from answering promptly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn health_answers_under_many_concurrent_slow_handlers() {
-        let state = test_state();
+        let (state, path) = test_state();
         const CONCURRENT_SLOW_CALLS: usize = 8;
 
         let mut slow_tasks = Vec::with_capacity(CONCURRENT_SLOW_CALLS);
@@ -251,5 +293,6 @@ mod tests {
                 .expect("slow handler task must not panic")
                 .expect("with_db must not error for a trivial closure");
         }
+        let _ = std::fs::remove_file(&path);
     }
 }

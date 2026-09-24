@@ -609,7 +609,7 @@ mod tests {
         use crate::index::lock::IndexLocks;
         use crate::server::state::AppState;
         use crate::server::stats::StatsCache;
-        use crate::storage::{BatchConfig, BatchWriter, Db, DbConfig, DbPool, MigrationRunner};
+        use mcp_service4agent::storage::{BatchConfig, BatchWriter, Db, DbConfig, MigrationRunner, ReadPoolConfig};
         use std::sync::RwLock;
 
         let dir = temp_watch_dir("reindex-driver");
@@ -626,16 +626,17 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
 
         let db = Db::open(&DbConfig::new(&db_path)).expect("writer db opens");
-        db.run_migrations(MigrationRunner::new(crate::storage::migrations::legacy_schema_migrations()))
+        db.run_migrations(MigrationRunner::new(crate::db::legacy_schema::legacy_schema_migrations()))
             .await
             .expect("migration applies");
-        let reader_pool = DbPool::open_with_size(&DbConfig::new(&db_path), 2).expect("pool opens");
+        let reader_pool = Arc::new(ReadPoolConfig::new(&db_path).pool_size(2).open().expect("pool opens"));
         let writer = BatchWriter::new(db.clone(), BatchConfig::default());
 
         let state: SharedState = Arc::new(AppState {
             storage: crate::server::state::Storage::ready(writer, reader_pool.clone()),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
+            checkpoint_cache: Arc::new(RwLock::new(crate::server::checkpoint::CheckpointCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
             read_model: crate::model::ReadModel::new(),

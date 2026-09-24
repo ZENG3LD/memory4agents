@@ -49,25 +49,36 @@ impl StatsCache {
     }
 }
 
+/// Reads the three counts the cache reports, against one checked-out
+/// reader-pool connection. Kept as a plain `&Connection` function (not a
+/// closure inlined at the call site) so its own `?`-propagated `CoreError`s
+/// are easy to read independently of how the connection was obtained.
+fn collect_stats(conn: &rusqlite::Connection) -> Result<(u32, u32, u32), CoreError> {
+    let workspace_count = reader::list_workspaces(conn)?.len() as u32;
+    let symbol_count = reader::count_symbols(conn, None)?;
+    let file_count = reader::count_files(conn, None)?;
+    Ok((workspace_count, symbol_count, file_count))
+}
+
 /// Runs one stats refresh against the database and stores the result in
 /// `state.stats_cache`.
 ///
-/// The query itself runs inside `spawn_blocking` over one checked-out
-/// reader-pool connection, so it never blocks a tokio worker thread and
-/// never contends with the single writer or with any other route.
+/// The query itself runs inside [`crate::server::state`]'s reader pool's own
+/// `spawn_blocking`, over one checked-out connection, so it never blocks a
+/// tokio worker thread and never contends with the single writer or with any
+/// other route.
 async fn refresh_once(state: &Arc<AppState>) {
-    let result = match state.reader_pool().acquire().await {
-        Ok(guard) => {
-            tokio::task::spawn_blocking(move || -> Result<(u32, u32, u32), CoreError> {
-                let workspace_count = reader::list_workspaces(&guard)?.len() as u32;
-                let symbol_count = reader::count_symbols(&guard, None)?;
-                let file_count = reader::count_files(&guard, None)?;
-                Ok((workspace_count, symbol_count, file_count))
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|inner| inner.map_err(|e| e.to_string()))
-        }
+    // `collect_stats` returns `CoreError`, not `rusqlite::Error` — wrapped in
+    // `Ok(..)` so the closure still satisfies `ReadPool::read_labeled`'s own
+    // `rusqlite::Result<T>` contract; flattened right after.
+    let outcome = state
+        .reader_pool()
+        .read_labeled("stats_refresh", None, |_: &Result<(u32, u32, u32), CoreError>| 0u64, |conn| {
+            Ok(collect_stats(conn))
+        })
+        .await;
+    let result: Result<(u32, u32, u32), String> = match outcome {
+        Ok(inner) => inner.map_err(|e| e.to_string()),
         Err(e) => Err(format!("reader pool: {e}")),
     };
 

@@ -21,10 +21,11 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 
+use crate::db::legacy_schema::legacy_schema_migrations;
 use crate::db::{reader, writer};
 use crate::model::snapshot::Snapshot;
 use crate::search::trigram::fuzzy_search;
-use crate::storage::migrations::{legacy_schema_migrations, MigrationRunner};
+use mcp_service4agent::storage::MigrationRunner;
 use crate::types::{
     CallEdge, CrateNode, DepEdge, FileEdge, FileEdgeKind, FileRecord, Symbol, SymbolKind, Visibility,
 };
