@@ -125,6 +125,7 @@ impl MigrationRunner {
 /// | 5 | `symbols.callsite_count` |
 /// | 6 | `symbols.type_use_count` + `type_use_edges` table + indexes |
 /// | 7 | `symbols.impl_trait` + index |
+/// | 8 | `idx_symbols_workspace_name` — composite `(workspace_id, name)` index; every `workspace_id = ? AND name = ?` read (the ambiguity-guard definition count, `get_symbols_by_name`, `resolve_symbol_to_crate`, `get_symbols_by_name_prefix`, `get_impls_of_trait`, …) used to seek `idx_symbols_name(name)` alone and then pay one rowid lookup per matching row just to filter `workspace_id` — 13.8s for a bare name with ~18k definitions against the live 2.76 GB DB, down to ~1s (covering-index scan, no rowid lookups) with this index (2026-09-24 read-path audit) |
 pub fn legacy_schema_migrations() -> Vec<Migration> {
     vec![
         Migration::new(1, "base_tables", BASE_TABLES_SQL),
@@ -167,6 +168,11 @@ pub fn legacy_schema_migrations() -> Vec<Migration> {
             "impl_trait",
             "ALTER TABLE symbols ADD COLUMN impl_trait TEXT;
              CREATE INDEX IF NOT EXISTS idx_symbols_impl_trait ON symbols(workspace_id, impl_trait) WHERE impl_trait IS NOT NULL;",
+        ),
+        Migration::new(
+            8,
+            "symbols_workspace_name_idx",
+            "CREATE INDEX IF NOT EXISTS idx_symbols_workspace_name ON symbols(workspace_id, name);",
         ),
     ]
 }
@@ -400,12 +406,12 @@ mod tests {
         let mut conn = mem();
         MigrationRunner::new(legacy_schema_migrations())
             .run(&mut conn)
-            .expect("v1..v7 apply cleanly against an empty database");
+            .expect("v1..v8 apply cleanly against an empty database");
 
         let version_count: u32 = conn
             .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
             .expect("count query");
-        assert_eq!(version_count, 7);
+        assert_eq!(version_count, 8);
 
         // Every column each version was supposed to add is queryable.
         conn.execute(
@@ -578,7 +584,7 @@ CREATE TABLE IF NOT EXISTS crate_dep_edges (
         seed_legacy_versions_if_needed(&conn).expect("backfill succeeds");
         MigrationRunner::new(legacy_schema_migrations())
             .run(&mut conn)
-            .expect("no SQL re-runs against an already-backfilled db");
+            .expect("v1..v7 don't re-run against an already-backfilled db; v8 runs for the first time");
 
         let rows: Vec<u32> = conn
             .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -587,7 +593,7 @@ CREATE TABLE IF NOT EXISTS crate_dep_edges (
             .expect("query_map")
             .collect::<Result<_, _>>()
             .expect("collect");
-        assert_eq!(rows, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(rows, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
         // Every touched column still reads/writes fine after the backfill.
         conn.execute(
