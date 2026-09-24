@@ -131,7 +131,7 @@ pub async fn build_all_workspaces(reader_pool: &DbPool, read_model: &ReadModel) 
 /// caller — mirrors `crate::watch::CoalesceState`'s own pattern.
 pub fn request_rebuild(state: &SharedState, workspace_id: String) {
     let read_model = state.read_model.clone();
-    let reader_pool = state.reader_pool.clone();
+    let reader_pool = state.reader_pool().clone();
 
     let should_spawn = {
         let mut rs = read_model.rebuild.lock().unwrap_or_else(|p| p.into_inner());

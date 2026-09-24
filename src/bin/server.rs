@@ -7,7 +7,7 @@ use memory4agent::server::config::Config;
 #[cfg(feature = "nemo")]
 use memory4agent::server::registration;
 use memory4agent::server::startup::{run_migrations_and_build_snapshots, StartupState};
-use memory4agent::server::state::{AppState, SharedState};
+use memory4agent::server::state::{AppState, SharedState, Storage};
 use memory4agent::server::stats::{spawn_stats_refresher, StatsCache};
 use memory4agent::server::routes;
 use memory4agent::storage::migrations::legacy_schema_migrations;
@@ -28,20 +28,13 @@ async fn main() {
 
     let db_path = format!("{}/index.db", config.data_dir);
 
-    // The writer's own connection. Never handed to a route handler — only
-    // `BatchWriter`'s worker thread (started below) and the background
-    // startup sequence touch it directly. Opening it and the reader pool is
-    // fast (pragmas only, no schema work) — migrations run later, off the
-    // request path, see below.
-    let db = Db::open(&DbConfig::new(&db_path)).expect("failed to open writer db");
-    let reader_pool = DbPool::open_with_size(&DbConfig::new(&db_path), config.reader_pool_size)
-        .expect("failed to open reader pool");
-    let writer = BatchWriter::new(db.clone(), BatchConfig::default());
-
+    // Nothing here touches the database: the handles are opened by the
+    // background startup task after the listener is bound (owner ruling
+    // 2026-09-24 — `/health` and the database work never block each other;
+    // opening alone can take minutes when SQLite replays a large WAL).
     let state: SharedState = Arc::new(AppState {
-        writer,
-        reader_pool,
-        data_dir: config.data_dir,
+        storage: std::sync::OnceLock::new(),
+        data_dir: config.data_dir.clone(),
         stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
         index_locks: IndexLocks::new(),
         last_index: Arc::new(RwLock::new(None)),
@@ -78,10 +71,35 @@ async fn main() {
     // and `snapshot`/`all_snapshots`) until this background task reaches
     // `StartupPhase::Ready` — see `server::startup`.
     let startup_state = state.clone();
-    let startup_db = db.clone();
+    let reader_pool_size = config.reader_pool_size;
     tokio::spawn(async move {
+        let opened = tokio::task::spawn_blocking(move || {
+            let db = Db::open(&DbConfig::new(&db_path)).map_err(|e| format!("writer db: {e}"))?;
+            let pool = DbPool::open_with_size(&DbConfig::new(&db_path), reader_pool_size)
+                .map_err(|e| format!("reader pool: {e}"))?;
+            Ok::<_, String>((db, pool))
+        })
+        .await;
+        let (db, reader_pool) = match opened {
+            Ok(Ok(handles)) => handles,
+            Ok(Err(e)) => {
+                tracing::error!("opening the database failed: {e}");
+                return;
+            }
+            Err(e) => {
+                tracing::error!("opening the database panicked: {e}");
+                return;
+            }
+        };
+        let writer = BatchWriter::new(db.clone(), BatchConfig::default());
+        if startup_state.storage.set(Storage { writer, reader_pool }).is_err() {
+            tracing::error!("database handles were already set");
+            return;
+        }
+        tracing::info!("database open");
+
         let migrations = MigrationRunner::new(legacy_schema_migrations());
-        if let Err(e) = run_migrations_and_build_snapshots(startup_state.clone(), startup_db, migrations).await {
+        if let Err(e) = run_migrations_and_build_snapshots(startup_state.clone(), db, migrations).await {
             tracing::error!("startup sequence failed: {e}");
             return;
         }

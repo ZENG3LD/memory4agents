@@ -15,9 +15,26 @@ use crate::CoreError;
 /// handle — is never held here directly; only `BatchWriter`'s dedicated
 /// worker thread and the migration bootstrap in `bin/server.rs` ever touch
 /// it. See `memory4agent/CLAUDE.md`'s "Storage engine" section.
-pub struct AppState {
+/// The database handles. Opened by the background startup task AFTER the
+/// listener is bound — never on the main path: opening can be slow (SQLite
+/// replays a large WAL on first open) and must not keep `/health` down.
+pub struct Storage {
     pub writer: BatchWriter,
     pub reader_pool: DbPool,
+}
+
+impl Storage {
+    /// An already-open storage cell, for callers that open the database
+    /// themselves (tests, tools).
+    pub fn ready(writer: BatchWriter, reader_pool: DbPool) -> std::sync::OnceLock<Storage> {
+        std::sync::OnceLock::from(Storage { writer, reader_pool })
+    }
+}
+
+pub struct AppState {
+    /// Set once by the startup task; empty while the database is opening.
+    /// Routes gate on [`StartupState`] and never read it before `Ready`.
+    pub storage: std::sync::OnceLock<Storage>,
     pub data_dir: String,
     /// Last known DB stats for `/health`, refreshed by a background task.
     /// See [`crate::server::stats::spawn_stats_refresher`].
@@ -43,6 +60,25 @@ pub struct AppState {
 }
 
 pub type SharedState = Arc<AppState>;
+
+impl AppState {
+    /// The single writer. Only valid once the startup task has opened the
+    /// database — every caller runs after `startup.is_ready()`.
+    pub fn writer(&self) -> &BatchWriter {
+        &self.opened().writer
+    }
+
+    /// The reader pool. Same validity rule as [`AppState::writer`].
+    pub fn reader_pool(&self) -> &DbPool {
+        &self.opened().reader_pool
+    }
+
+    fn opened(&self) -> &Storage {
+        self.storage
+            .get()
+            .expect("database not open yet: callers must gate on startup.is_ready()")
+    }
+}
 
 #[derive(Debug)]
 pub enum AppError {
@@ -98,7 +134,7 @@ impl IntoResponse for AppError {
 /// [`DbPool`]'s N connections here only ever blocks the (bounded) set of
 /// callers that also need a reader-pool slot at the same instant — it never
 /// blocks `/health` (which never touches the database at all) and it never
-/// blocks the single writer thread `state.writer` owns.
+/// blocks the single writer thread `state.writer()` owns.
 pub async fn with_db<T, F>(state: &SharedState, f: F) -> Result<T, AppError>
 where
     T: Send + 'static,
@@ -108,7 +144,7 @@ where
         return Err(AppError::NotReady(state.startup.get()));
     }
     let guard = state
-        .reader_pool
+        .reader_pool()
         .acquire()
         .await
         .map_err(|e| AppError::Internal(format!("reader pool: {e}")))?;
@@ -194,8 +230,7 @@ mod tests {
         let reader_pool = DbPool::open_with_size(&DbConfig::new(&path), 4).expect("pool opens");
         let writer = BatchWriter::new(db.clone(), BatchConfig::default());
         let state: SharedState = Arc::new(AppState {
-            writer: writer.clone(),
-            reader_pool,
+            storage: crate::server::state::Storage::ready(writer.clone(), reader_pool),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),

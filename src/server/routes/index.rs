@@ -39,7 +39,7 @@ pub(crate) async fn post_index_impl(state: &SharedState, req: IndexRequest) -> R
         return Err(AppError::NotReady(state.startup.get()));
     }
     let _guard = state.index_locks.acquire(&req.workspace_id).await;
-    let result = Indexer::run(&state.reader_pool, &state.writer, &req).await?;
+    let result = Indexer::run(state.reader_pool(), state.writer(), &req).await?;
     // Piece 0.12: rebuild this workspace's read-model snapshot off the
     // request path (single-flight + coalesced — see
     // `model::read_model::request_rebuild`) now that `Indexer::run`'s own

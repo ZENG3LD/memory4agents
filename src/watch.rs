@@ -175,7 +175,7 @@ async fn run_reindex_driver(
             force: false,
         };
         let _guard = state.index_locks.acquire(&workspace_id).await;
-        match Indexer::run_changed_paths(&state.reader_pool, &state.writer, &req, batch).await {
+        match Indexer::run_changed_paths(state.reader_pool(), state.writer(), &req, batch).await {
             Ok(result) => {
                 tracing::info!(
                     files_indexed = result.files_indexed,
@@ -633,8 +633,7 @@ mod tests {
         let writer = BatchWriter::new(db.clone(), BatchConfig::default());
 
         let state: SharedState = Arc::new(AppState {
-            writer,
-            reader_pool: reader_pool.clone(),
+            storage: crate::server::state::Storage::ready(writer, reader_pool.clone()),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),

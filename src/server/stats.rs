@@ -56,7 +56,7 @@ impl StatsCache {
 /// reader-pool connection, so it never blocks a tokio worker thread and
 /// never contends with the single writer or with any other route.
 async fn refresh_once(state: &Arc<AppState>) {
-    let result = match state.reader_pool.acquire().await {
+    let result = match state.reader_pool().acquire().await {
         Ok(guard) => {
             tokio::task::spawn_blocking(move || -> Result<(u32, u32, u32), CoreError> {
                 let workspace_count = reader::list_workspaces(&guard)?.len() as u32;

@@ -127,7 +127,10 @@ async fn get_ready(State(state): State<SharedState>) -> impl IntoResponse {
 }
 
 async fn ready_probe(state: &SharedState) -> Result<(), String> {
-    let guard = state.reader_pool.acquire().await.map_err(|e| e.to_string())?;
+    if state.storage.get().is_none() {
+        return Err(format!("database not open yet (phase {:?})", state.startup.get()));
+    }
+    let guard = state.reader_pool().acquire().await.map_err(|e| e.to_string())?;
     tokio::task::spawn_blocking(move || {
         guard
             .query_row("SELECT 1", [], |_row| Ok(()))
@@ -154,8 +157,7 @@ mod tests {
         let reader_pool = DbPool::open_with_size(&DbConfig::in_memory(), 8).expect("in-memory reader pool opens");
         let writer = BatchWriter::new(db, BatchConfig::default());
         Arc::new(AppState {
-            writer,
-            reader_pool,
+            storage: crate::server::state::Storage::ready(writer, reader_pool),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
@@ -176,7 +178,7 @@ mod tests {
         // Simulate a long-running DB read (what count_symbols used to do
         // over the 2.7GB on-disk index) holding one pool connection.
         let (lock_acquired_tx, lock_acquired_rx) = tokio::sync::oneshot::channel();
-        let pool = state.reader_pool.clone();
+        let pool = state.reader_pool().clone();
         let hold_task = tokio::spawn(async move {
             let guard = pool.acquire().await.expect("acquire reader pool connection");
             tokio::task::spawn_blocking(move || {

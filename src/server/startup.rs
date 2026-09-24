@@ -125,7 +125,7 @@ pub async fn run_migrations_and_build_snapshots(
     db.run_migrations(migrations).await?;
 
     state.startup.set(StartupPhase::BuildingSnapshot);
-    crate::model::read_model::build_all_workspaces(&state.reader_pool, &state.read_model).await?;
+    crate::model::read_model::build_all_workspaces(state.reader_pool(), &state.read_model).await?;
 
     state.startup.set(StartupPhase::Ready);
     tracing::info!("startup complete — serving hot routes from the read model");
@@ -174,8 +174,7 @@ mod tests {
         assert_eq!(startup.get(), StartupPhase::Migrating, "boot must start in the migrating phase");
 
         let state: SharedState = Arc::new(AppState {
-            writer,
-            reader_pool,
+            storage: crate::server::state::Storage::ready(writer, reader_pool),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
@@ -226,8 +225,7 @@ mod tests {
         let startup = StartupState::new();
 
         let state: SharedState = Arc::new(AppState {
-            writer,
-            reader_pool,
+            storage: crate::server::state::Storage::ready(writer, reader_pool),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),

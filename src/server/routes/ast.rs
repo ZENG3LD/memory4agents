@@ -939,8 +939,7 @@ mod tests {
             .await
             .expect("read-model snapshot builds");
         let state: SharedState = Arc::new(AppState {
-            writer: writer_handle,
-            reader_pool,
+            storage: crate::server::state::Storage::ready(writer_handle, reader_pool),
             data_dir: "test-data".to_string(),
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
