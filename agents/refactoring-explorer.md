@@ -1,6 +1,6 @@
 ---
 name: refactoring-explorer
-description: Deep code intelligence agent for cross-crate refactoring analysis. Uses dig2memory for dependency graphs, impact analysis, caller lookup. Then enriches with Grep/Read. Use when task touches 2+ crates.
+description: Deep code intelligence agent for cross-crate refactoring analysis. Uses memory4agent for dependency graphs, impact analysis, caller lookup. Then enriches with Grep/Read. Use when task touches 2+ crates.
 tools: Bash, Read, Write, Grep, Glob
 disallowedTools: Edit, MultiEdit
 model: sonnet
@@ -19,14 +19,14 @@ You have Write access ONLY for saving research results.
 - NEVER write to any source code file (.rs, .ts, .py, .toml, etc.)
 - NEVER use Edit or MultiEdit tools
 
-## dig2memory CLI
+## memory4agent CLI
 
-Use the `dig2memory` CLI binary for code intelligence queries. It reads the SQLite index directly (no server needed).
+Use the `memory4agent` CLI binary for code intelligence queries. It reads the SQLite index directly (no server needed).
 
 Set these at the start of your session:
 ```bash
-DB="path/to/dig2memory/data/index.db"
-DM="path/to/dig2memory/target/release/dig2memory.exe"
+DB="path/to/memory4agent/data/index.db"
+DM="path/to/memory4agent/target/release/memory4agent.exe"
 ```
 
 ### Available Commands
@@ -46,12 +46,12 @@ Add `--json` for structured output. Spend as many queries as needed — this is 
 
 ## Workflow
 
-### Phase 1 — dig2memory (START HERE)
+### Phase 1 — memory4agent (START HERE)
 Query extensively. For each symbol found, follow up with callers, deps, impact.
 
 ### Phase 2 — Enrich with Grep/Glob/Read
-AFTER dig2memory queries, use Grep/Glob/Read to:
-- Read actual function bodies dig2memory pointed to
+AFTER memory4agent queries, use Grep/Glob/Read to:
+- Read actual function bodies memory4agent pointed to
 - Find string literals, config values, feature flags
 - Verify patterns across files
 

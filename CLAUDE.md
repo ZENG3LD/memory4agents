@@ -1,6 +1,6 @@
 # memory4agent — Code Intelligence Server
 
-Renamed from `dig2memory` (2026-09-23) — this crate is code-intelligence and
+This crate is code-intelligence and
 memory infrastructure for coding agents (Claude Code, Codex, Kimi, Grok CLIs),
 not just an AST index. The rename plan is
 `docs/memory4agent/plans/2026-09-23-memory4agent-plan.md`; read its
@@ -14,18 +14,12 @@ not just an AST index. The rename plan is
   BM25+vector retrieval core.
 - **Stack**: tree-sitter (Rust/TS/Python/Go grammars), SQLite (WAL), axum,
   cargo_metadata.
-- **Location**: this directory is still named `dig2memory/` on disk — the
-  directory/repo rename is plan piece 0.1, deliberately deferred to land
-  together with the first deploy of the renamed binary. The crate/package
-  name, both binaries, env vars, and the d-watchdog service name are
-  `memory4agent` already (piece 0.2).
 - **Binaries**: `memory4agent-server` (HTTP daemon) and `memory4agent` (CLI,
   reads the SQLite index directly — no server needed).
 - **DB**: `./data/index.db` (~2.76 GB, ~580K symbols, ~30K files
-  as of 2026-09). The on-disk directory name is unchanged by the rename —
-  only the env var that points at it changed name (`MEMORY4AGENT_DATA_DIR`).
-  The 126 KB `dig2memory/data/index.db` some older docs pointed at is a
-  stale stub, not the live database — always use the env-var path.
+  as of 2026-09) — read via `MEMORY4AGENT_DATA_DIR`. The 126 KB
+  `memory4agent/data/index.db` some older docs pointed at is a stale stub,
+  not the live database — always use the env-var path.
 - **Agent access**: Only agents with Bash + `permissionMode: default` can
   curl. WebFetch doesn't reach localhost (runs on Anthropic servers). Agents
   with `dontAsk` don't get Bash even if listed in tools.
@@ -99,12 +93,12 @@ global-mutex defect).
 ## Starting the server
 
 ```bash
-cd dig2memory && cargo run --release --bin memory4agent-server
+cd memory4agent && cargo run --release --bin memory4agent-server
 ```
 
 Or with explicit data dir:
 ```bash
-cd dig2memory && MEMORY4AGENT_DATA_DIR="./data" ./target/release/memory4agent-server.exe &
+cd memory4agent && MEMORY4AGENT_DATA_DIR="./data" ./target/release/memory4agent-server.exe &
 ```
 
 Env vars: `MEMORY4AGENT_PORT` (default 18200), `MEMORY4AGENT_DATA_DIR`

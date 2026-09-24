@@ -3,10 +3,9 @@
 Code-intelligence and memory infrastructure for coding agents (Claude Code,
 Codex, Kimi, Grok CLIs and others). Indexes codebases using tree-sitter AST
 parsing, builds dependency graphs, and provides fuzzy symbol search, caller
-tracking, and impact analysis. Formerly published as `dig2memory` — this is
-the same server and CLI, renamed and under active extension (MCP tool
-surface, SCIP precise index, personalized-PageRank repo map, a decision
-log, and hybrid BM25+vector retrieval are all in progress).
+tracking, and impact analysis. MCP tool surface, SCIP precise index,
+personalized-PageRank repo map, a decision log, and hybrid BM25+vector
+retrieval are all in progress.
 
 **Supported languages**: Rust, TypeScript/JavaScript (TSX/JSX), Python, Go
 
@@ -149,7 +148,7 @@ See `CLAUDE.md` for the full endpoint list (duplicate/dead-code/usage analysis r
 
 ### As a Skill
 
-Copy `skills/dig2memory/SKILL.md` to your project's `.claude/skills/memory4agent/SKILL.md`. Then use `/memory4agent search MyStruct` in Claude Code.
+Copy `skills/memory4agent/SKILL.md` to your project's `.claude/skills/memory4agent/SKILL.md`. Then use `/memory4agent search MyStruct` in Claude Code.
 
 ### As an Agent
 

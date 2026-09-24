@@ -455,9 +455,9 @@ mod tests {
         let dir = temp_watch_dir("gitmodules-parse");
         std::fs::write(
             dir.join(".gitmodules"),
-            "[submodule \"dig2memory\"]\n\
-             \tpath = dig2memory\n\
-             \turl = ../dig2memory\n\
+            "[submodule \"memory4agent\"]\n\
+             \tpath = memory4agent\n\
+             \turl = ../memory4agent\n\
              [submodule \"uzor\"]\n\
              \tpath = uzor\n\
              \turl = ../uzor\n",
@@ -466,7 +466,7 @@ mod tests {
 
         let mut paths = read_gitmodule_paths(&dir);
         paths.sort();
-        assert_eq!(paths, vec!["dig2memory".to_string(), "uzor".to_string()]);
+        assert_eq!(paths, vec!["memory4agent".to_string(), "uzor".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,10 +1,10 @@
 ---
-name: dig2memory
-description: Query the code intelligence index (AST symbols, callers, dependencies, impact analysis). Use when user says dig2memory, find symbol, who calls, impact analysis, code graph, crate deps, hotspots.
+name: memory4agent
+description: Query the code intelligence index (AST symbols, callers, dependencies, impact analysis). Use when user says memory4agent, find symbol, who calls, impact analysis, code graph, crate deps, hotspots.
 argument-hint: <subcommand> [args]
 ---
 
-You have access to the `dig2memory` CLI tool for code intelligence queries.
+You have access to the `memory4agent` CLI tool for code intelligence queries.
 
 The user wants: $ARGUMENTS
 
@@ -12,13 +12,13 @@ The user wants: $ARGUMENTS
 
 The CLI binary must be built first:
 ```bash
-cd dig2memory && cargo build --release --package dig2memory-cli
+cd memory4agent && cargo build --release --bin memory4agent
 ```
 
 Set these variables in your shell commands:
 ```bash
-DB="path/to/dig2memory/data/index.db"
-DM="path/to/dig2memory/target/release/dig2memory.exe"  # or just `dig2memory` if in PATH
+DB="path/to/memory4agent/data/index.db"
+DM="path/to/memory4agent/target/release/memory4agent.exe"  # or just `memory4agent` if in PATH
 ```
 
 ## Commands

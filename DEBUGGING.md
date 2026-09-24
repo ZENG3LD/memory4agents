@@ -1,4 +1,4 @@
-# dig2memory Debugging Notes
+# memory4agent Debugging Notes
 
 ## TS File-Edge Path Normalization Bug
 
@@ -8,7 +8,7 @@ When indexing the TypeScript-heavy workspace:
 
 - workspace root: `.\sandbox-ts`
 - workspace id: `sample-ts`
-- DB: `dig2memory\data-sandbox-ts\index.db`
+- DB: `memory4agent\data-sandbox-ts\index.db`
 
 the AST/symbol index works, but graph queries are partially broken because
 TypeScript file edges are stored with non-normalized paths like:
@@ -24,16 +24,16 @@ instead of:
 These queries were run with:
 
 - binary:
-  `dig2memory\target-ts\release\dig2memory.exe`
+  `memory4agent\target-ts\release\memory4agent.exe`
 - DB:
-  `dig2memory\data-sandbox-ts\index.db`
+  `memory4agent\data-sandbox-ts\index.db`
 - workspace:
   `sample-ts`
 
 Working query:
 
 ```powershell
-dig2memory.exe --db ... --workspace sample-ts --json deps "src/tools.ts"
+memory4agent.exe --db ... --workspace sample-ts --json deps "src/tools.ts"
 ```
 
 It returns edges like:
@@ -44,7 +44,7 @@ It returns edges like:
 Broken query:
 
 ```powershell
-dig2memory.exe --db ... --workspace sample-ts --json impact "src/Tool.ts"
+memory4agent.exe --db ... --workspace sample-ts --json impact "src/Tool.ts"
 ```
 
 It returns:
@@ -56,7 +56,7 @@ It returns:
 But this works:
 
 ```powershell
-dig2memory.exe --db ... --workspace sample-ts --json impact "src/./Tool.ts"
+memory4agent.exe --db ... --workspace sample-ts --json impact "src/./Tool.ts"
 ```
 
 It returns reverse deps such as:
@@ -88,7 +88,7 @@ Especially around import resolution and emitted `file_edges`.
 
 ### Why this matters
 
-For TS codebases like `sample-ts`, `dig2memory` is still useful for:
+For TS codebases like `sample-ts`, `memory4agent` is still useful for:
 
 - symbols
 - symbol search

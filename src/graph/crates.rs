@@ -120,7 +120,7 @@ fn parse_one_manifest(
             pkg_dir.to_string()
         };
 
-        // manifest_path stored relative, e.g. "dig2memory/Cargo.toml" or
+        // manifest_path stored relative, e.g. "memory4agent/Cargo.toml" or
         // "mail4agent/crates/app/Cargo.toml" for a multi-crate submodule.
         let manifest_rel = if let Some(stripped) = pkg_manifest.strip_prefix(root_str) {
             stripped.trim_start_matches('/').to_string()

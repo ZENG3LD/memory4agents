@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Core error type for dig2memory-core.
+/// Core error type for memory4agent-core.
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("database error: {0}")]

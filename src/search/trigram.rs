@@ -65,7 +65,7 @@ pub fn fuzzy_search(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -134,11 +134,11 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         file_path: row.get(2)?,
         name: row.get(3)?,
         kind: SymbolKind::from_str(&kind_str).unwrap_or_else(|| {
-            tracing::warn!("[dig2memory] unknown SymbolKind: {kind_str}");
+            tracing::warn!("[memory4agent] unknown SymbolKind: {kind_str}");
             SymbolKind::Function
         }),
         visibility: Visibility::from_str(&vis_str).unwrap_or_else(|| {
-            tracing::warn!("[dig2memory] unknown Visibility: {vis_str}");
+            tracing::warn!("[memory4agent] unknown Visibility: {vis_str}");
             Visibility::Private
         }),
         line: row.get(6)?,

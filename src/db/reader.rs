@@ -13,11 +13,11 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         file_path: row.get(2)?,
         name: row.get(3)?,
         kind: SymbolKind::from_str(&kind_str).unwrap_or_else(|| {
-            tracing::warn!("[dig2memory] unknown SymbolKind: {kind_str}");
+            tracing::warn!("[memory4agent] unknown SymbolKind: {kind_str}");
             SymbolKind::Function
         }),
         visibility: Visibility::from_str(&vis_str).unwrap_or_else(|| {
-            tracing::warn!("[dig2memory] unknown Visibility: {vis_str}");
+            tracing::warn!("[memory4agent] unknown Visibility: {vis_str}");
             Visibility::Private
         }),
         line: row.get(6)?,
@@ -66,7 +66,7 @@ pub fn get_symbols_in_file(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -187,7 +187,7 @@ fn collect_caller_rows(
                     results.push(s);
                 }
             }
-            Err(e) => tracing::warn!("[dig2memory] row read error: {e}"),
+            Err(e) => tracing::warn!("[memory4agent] row read error: {e}"),
         }
     }
 }
@@ -210,7 +210,7 @@ pub fn get_deps_of_file(
                 from_file: row.get(1)?,
                 to_file: row.get(2)?,
                 kind: FileEdgeKind::from_str(&kind_str).unwrap_or_else(|| {
-                    tracing::warn!("[dig2memory] unknown FileEdgeKind: {kind_str}");
+                    tracing::warn!("[memory4agent] unknown FileEdgeKind: {kind_str}");
                     FileEdgeKind::UseDecl
                 }),
             })
@@ -218,7 +218,7 @@ pub fn get_deps_of_file(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -265,7 +265,7 @@ pub fn list_crate_nodes(
                 .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -282,7 +282,7 @@ pub fn list_crate_nodes(
                 .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -308,7 +308,7 @@ pub fn list_crate_deps(
                 .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -325,7 +325,7 @@ pub fn list_crate_deps(
                 .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -356,7 +356,7 @@ pub fn resolve_symbol_to_crate(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -377,7 +377,7 @@ pub fn resolve_symbol_to_crate(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -432,7 +432,7 @@ pub fn list_file_edges(
                         from_file: row.get(1)?,
                         to_file: row.get(2)?,
                         kind: FileEdgeKind::from_str(&kind_str).unwrap_or_else(|| {
-                    tracing::warn!("[dig2memory] unknown FileEdgeKind: {kind_str}");
+                    tracing::warn!("[memory4agent] unknown FileEdgeKind: {kind_str}");
                     FileEdgeKind::UseDecl
                 }),
                     })
@@ -440,7 +440,7 @@ pub fn list_file_edges(
                 .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -460,7 +460,7 @@ pub fn list_file_edges(
                         from_file: row.get(1)?,
                         to_file: row.get(2)?,
                         kind: FileEdgeKind::from_str(&kind_str).unwrap_or_else(|| {
-                    tracing::warn!("[dig2memory] unknown FileEdgeKind: {kind_str}");
+                    tracing::warn!("[memory4agent] unknown FileEdgeKind: {kind_str}");
                     FileEdgeKind::UseDecl
                 }),
                     })
@@ -468,7 +468,7 @@ pub fn list_file_edges(
                 .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -492,7 +492,7 @@ pub fn get_reverse_file_deps(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -521,7 +521,7 @@ pub fn get_hotspots(
                 .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -542,7 +542,7 @@ pub fn get_hotspots(
                 .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -567,7 +567,7 @@ pub fn get_symbols_by_name(
                 .filter_map(|r| match r {
                     Ok(v) => Some(v),
                     Err(e) => {
-                        tracing::warn!("[dig2memory] row read error: {e}");
+                        tracing::warn!("[memory4agent] row read error: {e}");
                         None
                     }
                 })
@@ -693,7 +693,7 @@ pub fn get_semantic_dup_rows(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] semantic dup row error: {e}");
+                tracing::warn!("[memory4agent] semantic dup row error: {e}");
                 None
             }
         })
@@ -721,7 +721,7 @@ pub fn get_duplicate_names(
                 .filter_map(|r| match r {
                     Ok(v) => Some(v),
                     Err(e) => {
-                        tracing::warn!("[dig2memory] row read error: {e}");
+                        tracing::warn!("[memory4agent] row read error: {e}");
                         None
                     }
                 })
@@ -853,7 +853,7 @@ pub fn list_workspaces(conn: &Connection) -> Result<Vec<Workspace>, CoreError> {
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -911,7 +911,7 @@ pub fn get_all_symbols_filtered(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -933,7 +933,7 @@ pub fn get_symbols_by_fingerprint(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] row read error: {e}");
+                tracing::warn!("[memory4agent] row read error: {e}");
                 None
             }
         })
@@ -979,7 +979,7 @@ pub fn get_type_users(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] type_users row error: {e}");
+                tracing::warn!("[memory4agent] type_users row error: {e}");
                 None
             }
         })
@@ -1029,7 +1029,7 @@ pub fn get_dead_types(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] dead_types row error: {e}");
+                tracing::warn!("[memory4agent] dead_types row error: {e}");
                 None
             }
         })
@@ -1096,7 +1096,7 @@ pub fn get_orphan_types(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] orphan_types row error: {e}");
+                tracing::warn!("[memory4agent] orphan_types row error: {e}");
                 None
             }
         })
@@ -1136,7 +1136,7 @@ pub fn get_usage_hotspots(
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!("[dig2memory] usage_hotspots row error: {e}");
+                tracing::warn!("[memory4agent] usage_hotspots row error: {e}");
                 None
             }
         })
@@ -1162,7 +1162,7 @@ pub fn get_symbols_by_name_prefix(
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    tracing::warn!("[dig2memory] row read error: {e}");
+                    tracing::warn!("[memory4agent] row read error: {e}");
                     None
                 }
             })
@@ -1172,7 +1172,7 @@ pub fn get_symbols_by_name_prefix(
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    tracing::warn!("[dig2memory] row read error: {e}");
+                    tracing::warn!("[memory4agent] row read error: {e}");
                     None
                 }
             })
@@ -1201,7 +1201,7 @@ pub fn get_impls_of_trait(
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    tracing::warn!("[dig2memory] row read error: {e}");
+                    tracing::warn!("[memory4agent] row read error: {e}");
                     None
                 }
             })
@@ -1211,7 +1211,7 @@ pub fn get_impls_of_trait(
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    tracing::warn!("[dig2memory] row read error: {e}");
+                    tracing::warn!("[memory4agent] row read error: {e}");
                     None
                 }
             })
@@ -1240,7 +1240,7 @@ pub fn get_inherent_impls_of_type(
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    tracing::warn!("[dig2memory] row read error: {e}");
+                    tracing::warn!("[memory4agent] row read error: {e}");
                     None
                 }
             })
@@ -1250,7 +1250,7 @@ pub fn get_inherent_impls_of_type(
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    tracing::warn!("[dig2memory] row read error: {e}");
+                    tracing::warn!("[memory4agent] row read error: {e}");
                     None
                 }
             })
@@ -1289,7 +1289,7 @@ pub fn get_impl_summary(
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    tracing::warn!("[dig2memory] row read error: {e}");
+                    tracing::warn!("[memory4agent] row read error: {e}");
                     None
                 }
             })
@@ -1301,7 +1301,7 @@ pub fn get_impl_summary(
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    tracing::warn!("[dig2memory] row read error: {e}");
+                    tracing::warn!("[memory4agent] row read error: {e}");
                     None
                 }
             })
