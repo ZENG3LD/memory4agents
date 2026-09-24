@@ -226,10 +226,28 @@ fn open_connection(cfg: &DbConfig) -> Result<Connection, DbError> {
     if !cfg.is_in_memory() {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(DbError::Pragma)?;
+        // Memory-mapped I/O so a range scan or a rowid-by-rowid join walk
+        // (e.g. `get_callers_of`'s JOIN back into `symbols`) can be served
+        // straight out of the OS page cache instead of a `pread` syscall
+        // per page. No-op on `:memory:` (nothing to map).
+        conn.pragma_update(None, "mmap_size", 1_073_741_824i64)
+            .map_err(DbError::Pragma)?;
     }
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(DbError::Pragma)?;
     conn.pragma_update(None, "busy_timeout", 5_000)
+        .map_err(DbError::Pragma)?;
+    // SQLite's own default page cache is ~2MB — against a multi-GB database
+    // that means any query needing more working set than that (a DISTINCT,
+    // a GROUP BY, a window function, or just a join that walks a wide
+    // b-tree range) constantly evicts and re-reads pages. Measured: a single
+    // `SELECT DISTINCT ...` over ~250k `call_edges` rows took ~22s at the
+    // default cache size against the live 2.76 GB `index.db`, ~2s at 128MB
+    // (2026-09-24 read-path audit). `temp_store = MEMORY` keeps that same
+    // DISTINCT/GROUP BY/window-function scratch space off disk entirely.
+    conn.pragma_update(None, "cache_size", -131_072i64)
+        .map_err(DbError::Pragma)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(DbError::Pragma)?;
     // Read-only by contract — see the module doc comment's "Deliberate
     // deviation from stk's pool".

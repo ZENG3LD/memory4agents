@@ -81,6 +81,13 @@ impl Db {
         }
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(DbError::Pragma)?;
+        // Same reasoning as `storage::pool::open_connection`'s own cache_size
+        // bump: SQLite's ~2MB default page cache thrashes against a
+        // multi-GB database on the writer's own bulk scans (e.g. the
+        // post-index callsite_count/type_use_count recompute) just as
+        // badly as it does on a reader's DISTINCT/JOIN.
+        conn.pragma_update(None, "cache_size", -131_072i64)
+            .map_err(DbError::Pragma)?;
 
         // `db::writer`'s hot indexing path (`insert_symbol`, `insert_symbol_trigrams`,
         // `insert_call_edge`, …) uses `Connection::prepare_cached` so a
