@@ -35,8 +35,16 @@ pub fn router() -> DocRouter<SharedState> {
 /// `"reindex"` action (fires this via [`spawn_reindex_job`] instead of
 /// waiting) — one code path for the actual indexing call either way.
 pub(crate) async fn post_index_impl(state: &SharedState, req: IndexRequest) -> Result<IndexResult, AppError> {
+    if !state.startup.is_ready() {
+        return Err(AppError::NotReady(state.startup.get()));
+    }
     let _guard = state.index_locks.acquire(&req.workspace_id).await;
     let result = Indexer::run(&state.reader_pool, &state.writer, &req).await?;
+    // Piece 0.12: rebuild this workspace's read-model snapshot off the
+    // request path (single-flight + coalesced — see
+    // `model::read_model::request_rebuild`) now that `Indexer::run`'s own
+    // trailing barrier guarantees every write it made is committed.
+    crate::model::read_model::request_rebuild(state, req.workspace_id.clone());
     Ok(result)
 }
 

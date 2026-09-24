@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::ast::known_types::{extract_type_names, tokenize_name};
 use crate::ast::synonyms::{canonical_label, synonym_group};
 use crate::db::reader;
-use crate::server::state::{with_db, AppError, SharedState};
+use crate::server::state::{snapshot, with_db, AppError, SharedState};
 use crate::types::Symbol;
 
 pub fn router() -> DocRouter<SharedState> {
@@ -776,22 +776,19 @@ struct TypeUsageResponse {
     members: Vec<TypeUsageMember>,
 }
 
+/// Piece 0.12: reads the read model — see
+/// `Snapshot::symbols_by_name_prefix`/`Snapshot::type_users`.
 pub(crate) async fn type_usage_impl(
     state: &SharedState,
     params: TypeUsageQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-    let symbols = reader::get_symbols_by_name_prefix(
-        db,
-        &params.workspace,
-        &params.name,
-        params.path_prefix.as_deref(),
-    )?;
+    let snap = snapshot(state, &params.workspace)?;
+    let symbols = snap.symbols_by_name_prefix(&params.name, params.path_prefix.as_deref());
 
     let want_breakdown = params.breakdown.unwrap_or(false);
     let mut members: Vec<TypeUsageMember> = Vec::new();
     for sym in symbols {
-        let users_raw = reader::get_type_users(db, &params.workspace, sym.id)?;
+        let users_raw = snap.type_users(sym.id);
         let users_by_kind: Option<HashMap<String, usize>> = if want_breakdown {
             let mut map: HashMap<String, usize> = HashMap::new();
             for u in &users_raw {
@@ -824,9 +821,7 @@ pub(crate) async fn type_usage_impl(
     }
 
     let resp = TypeUsageResponse { name: params.name, members };
-        Ok(serde_json::json!(resp))
-    })
-    .await
+    Ok(serde_json::json!(resp))
 }
 
 async fn type_usage(

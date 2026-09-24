@@ -165,7 +165,28 @@ async fn dispatch_symbol(state: &SharedState, args: Value) -> ToolOutcome {
         }
         "callers" => {
             let params = ast::SymQuery { sym: args.name, workspace };
-            tool_result(ast::callers_of_symbol_impl(state, params).await)
+            match ast::callers_of_symbol_impl(state, params).await {
+                Ok(value) => {
+                    // Explicit truncation marker for the MCP text output
+                    // (piece 0.12, item 4): a bare capped array gives an
+                    // agent no signal that more callers exist beyond
+                    // `model::MAX_CALLERS` — HTTP's `/ast/callers` keeps its
+                    // existing bare-array shape unchanged; this wrapping is
+                    // MCP-only. The ambiguous-refusal shape (an object, not
+                    // an array) is untouched — `as_array()` is `None` for it.
+                    if let Some(arr) = value.as_array() {
+                        if arr.len() >= crate::model::MAX_CALLERS {
+                            return ToolOutcome::ok(json!({
+                                "callers": value,
+                                "truncated": true,
+                                "truncated_at": crate::model::MAX_CALLERS,
+                            }));
+                        }
+                    }
+                    ToolOutcome::ok(value)
+                }
+                Err(e) => ToolOutcome::error(format!("{e:?}")),
+            }
         }
         "impact" => {
             let params = graph::SymbolImpactQuery { sym: args.name, workspace, depth: args.depth };
@@ -686,6 +707,10 @@ mod tests {
 
         let reader_pool = DbPool::open_with_size(&DbConfig::new(&path), 4).expect("reader pool opens");
         let writer_handle = BatchWriter::new(db, BatchConfig::default());
+        let read_model = crate::model::ReadModel::new();
+        crate::model::read_model::build_and_set(&reader_pool, &read_model, "ws")
+            .await
+            .expect("read-model snapshot builds");
         let state: SharedState = Arc::new(AppState {
             writer: writer_handle,
             reader_pool,
@@ -693,6 +718,8 @@ mod tests {
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
+            read_model,
+            startup: crate::server::startup::StartupState::ready(),
         });
         (state, path)
     }

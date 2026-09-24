@@ -5,11 +5,11 @@ use axum::{
 use mcp_service4agent::router::{DocRouter, RouteDoc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use crate::db::reader;
-use crate::search::trigram::fuzzy_search;
-use crate::server::state::{with_db, AppError, SharedState};
-use crate::types::Symbol;
+use crate::server::state::{snapshot, snapshots_for, with_db, AppError, SharedState};
+use crate::types::{SearchHit, Symbol};
 
 /// A bare name defined more than this many times in a workspace is refused
 /// by [`callers_of_symbol_impl`] with a named "ambiguous" response instead
@@ -113,16 +113,24 @@ pub(crate) struct AllDuplicatesQuery {
     pub(crate) kind: Option<String>,
 }
 
+/// Piece 0.12: reads the in-memory read model instead of the trigram table
+/// in SQL — see `crate::model::snapshot::Snapshot::fuzzy_search`. Merges
+/// across every loaded workspace when `params.workspace` is `None`,
+/// mirroring `search::trigram::fuzzy_search`'s own `workspace_id: None`
+/// convention.
 pub(crate) async fn search_symbols_impl(
     state: &SharedState,
     params: SearchQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let limit = params.limit.unwrap_or(50);
-        let results = fuzzy_search(db, params.workspace.as_deref(), &params.q, limit, 0.1)?;
-        Ok(serde_json::json!(results))
-    })
-    .await
+    let limit = params.limit.unwrap_or(50);
+    let snaps = snapshots_for(state, params.workspace.as_deref())?;
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for snap in &snaps {
+        hits.extend(snap.fuzzy_search(&params.q, limit, 0.1));
+    }
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    hits.truncate(limit as usize);
+    Ok(serde_json::json!(hits))
 }
 
 async fn search_symbols(
@@ -132,16 +140,14 @@ async fn search_symbols(
     Ok(Json(search_symbols_impl(&state, params).await?))
 }
 
+/// Piece 0.12: reads the read model — see `Snapshot::symbols_in_file`.
 pub(crate) async fn symbols_in_file_impl(
     state: &SharedState,
     params: FileQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let workspace = params.workspace.as_deref().unwrap_or("");
-        let results = reader::get_symbols_in_file(db, workspace, &params.file)?;
-        Ok(serde_json::json!(results))
-    })
-    .await
+    let workspace = params.workspace.as_deref().unwrap_or("");
+    let snap = snapshot(state, workspace)?;
+    Ok(serde_json::json!(snap.symbols_in_file(&params.file)))
 }
 
 async fn symbols_in_file(
@@ -151,28 +157,35 @@ async fn symbols_in_file(
     Ok(Json(symbols_in_file_impl(&state, params).await?))
 }
 
+/// Piece 0.12: reads the read model — see `Snapshot::count_definitions`/
+/// `Snapshot::callers_of`. Merges across every loaded workspace when
+/// `params.workspace` is `None`, same convention as `search_symbols_impl`.
 pub(crate) async fn callers_of_symbol_impl(
     state: &SharedState,
     params: SymQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let definition_count =
-            reader::count_symbol_definitions(db, &params.sym, params.workspace.as_deref())?;
-        if definition_count > AMBIGUOUS_DEFINITION_THRESHOLD {
-            return Ok(serde_json::json!({
-                "ambiguous": true,
-                "sym": params.sym,
-                "definition_count": definition_count,
-                "message": format!(
-                    "ambiguous: {definition_count} definitions of '{}' — pass a file or type to disambiguate",
-                    params.sym
-                ),
-            }));
+    let snaps = snapshots_for(state, params.workspace.as_deref())?;
+    let definition_count: u32 = snaps.iter().map(|s| s.count_definitions(&params.sym)).sum();
+    if definition_count > AMBIGUOUS_DEFINITION_THRESHOLD {
+        return Ok(serde_json::json!({
+            "ambiguous": true,
+            "sym": params.sym,
+            "definition_count": definition_count,
+            "message": format!(
+                "ambiguous: {definition_count} definitions of '{}' — pass a file or type to disambiguate",
+                params.sym
+            ),
+        }));
+    }
+    let mut results: Vec<Symbol> = Vec::new();
+    for snap in &snaps {
+        if results.len() >= crate::model::MAX_CALLERS {
+            break;
         }
-        let results = reader::get_callers_of(db, &params.sym, params.workspace.as_deref())?;
-        Ok(serde_json::json!(results))
-    })
-    .await
+        results.extend(snap.callers_of(&params.sym));
+    }
+    results.truncate(crate::model::MAX_CALLERS);
+    Ok(serde_json::json!(results))
 }
 
 async fn callers_of_symbol(
@@ -182,13 +195,11 @@ async fn callers_of_symbol(
     Ok(Json(callers_of_symbol_impl(&state, params).await?))
 }
 
+/// Piece 0.12: reads the read model — see `Snapshot::deps_of_file`.
 pub(crate) async fn file_deps_impl(state: &SharedState, params: FileQuery) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let workspace = params.workspace.as_deref().unwrap_or("");
-        let results = reader::get_deps_of_file(db, workspace, &params.file)?;
-        Ok(serde_json::json!(results))
-    })
-    .await
+    let workspace = params.workspace.as_deref().unwrap_or("");
+    let snap = snapshot(state, workspace)?;
+    Ok(serde_json::json!(snap.deps_of_file(&params.file)))
 }
 
 async fn file_deps(
@@ -385,28 +396,26 @@ fn classify_symbols(symbols: Vec<Symbol>) -> Vec<DuplicateGroup> {
     groups
 }
 
+/// Piece 0.12: reads the read model — see `Snapshot::symbols_by_name`.
+/// Merges across every loaded workspace when `params.workspace` is `None`.
 pub(crate) async fn duplicates_of_name_impl(
     state: &SharedState,
     params: DuplicatesQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let symbols = reader::get_symbols_by_name(
-            db,
-            &params.name,
-            params.workspace.as_deref(),
-            params.kind.as_deref(),
-        )?;
-        let total = symbols.len();
-        let groups = classify_symbols(symbols);
-        let resp = DuplicatesResponse {
-            name: params.name,
-            workspace: params.workspace,
-            groups,
-            total_locations: total,
-        };
-        Ok(serde_json::json!(resp))
-    })
-    .await
+    let snaps = snapshots_for(state, params.workspace.as_deref())?;
+    let mut symbols: Vec<Symbol> = Vec::new();
+    for snap in &snaps {
+        symbols.extend(snap.symbols_by_name(&params.name, params.kind.as_deref()));
+    }
+    let total = symbols.len();
+    let groups = classify_symbols(symbols);
+    let resp = DuplicatesResponse {
+        name: params.name,
+        workspace: params.workspace,
+        groups,
+        total_locations: total,
+    };
+    Ok(serde_json::json!(resp))
 }
 
 async fn duplicates_of_name(
@@ -685,35 +694,29 @@ struct ImplsResponse {
     total: usize,
 }
 
+/// Piece 0.12: reads the read model — see `Snapshot::impls_of_trait`.
 pub(crate) async fn impls_of_trait_impl(
     state: &SharedState,
     params: ImplsQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let symbols = reader::get_impls_of_trait(
-            db,
-            &params.workspace,
-            &params.trait_name,
-            params.path_prefix.as_deref(),
-        )?;
-        let total = symbols.len();
-        let implementors: Vec<ImplementorEntry> = symbols
-            .into_iter()
-            .map(|s| ImplementorEntry {
-                type_name: s.name,
-                file: s.file_path,
-                line: s.line,
-                impl_id: s.id,
-            })
-            .collect();
-        let resp = ImplsResponse {
-            trait_name: params.trait_name,
-            implementors,
-            total,
-        };
-        Ok(serde_json::json!(resp))
-    })
-    .await
+    let snap = snapshot(state, &params.workspace)?;
+    let symbols = snap.impls_of_trait(&params.trait_name, params.path_prefix.as_deref());
+    let total = symbols.len();
+    let implementors: Vec<ImplementorEntry> = symbols
+        .into_iter()
+        .map(|s| ImplementorEntry {
+            type_name: s.name,
+            file: s.file_path,
+            line: s.line,
+            impl_id: s.id,
+        })
+        .collect();
+    let resp = ImplsResponse {
+        trait_name: params.trait_name,
+        implementors,
+        total,
+    };
+    Ok(serde_json::json!(resp))
 }
 
 async fn impls_of_trait(
@@ -750,43 +753,33 @@ struct InherentImplsResponse {
     impls: Vec<InherentImplEntry>,
 }
 
+/// Piece 0.12: reads the read model — see
+/// `Snapshot::inherent_impls_of_type`/`Snapshot::method_count_for_impl`.
 pub(crate) async fn inherent_impls_of_type_impl(
     state: &SharedState,
     params: InherentImplsQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let impl_syms = reader::get_inherent_impls_of_type(
-            db,
-            &params.workspace,
-            &params.type_name,
-            params.path_prefix.as_deref(),
-        )?;
+    let snap = snapshot(state, &params.workspace)?;
+    let impl_syms = snap.inherent_impls_of_type(&params.type_name, params.path_prefix.as_deref());
 
-        let mut impls: Vec<InherentImplEntry> = Vec::new();
-        for sym in impl_syms {
-            // Count methods/functions whose parent_name == sym.name in the same file.
-            let count: i64 = db
-                .query_row(
-                    "SELECT COUNT(*) FROM symbols WHERE workspace_id = ?1 AND file_path = ?2 AND parent_name = ?3 AND kind IN ('function','async_function','method')",
-                    rusqlite::params![sym.workspace_id, sym.file_path, sym.name],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            impls.push(InherentImplEntry {
+    let impls: Vec<InherentImplEntry> = impl_syms
+        .into_iter()
+        .map(|sym| {
+            let count = snap.method_count_for_impl(&sym.file_path, &sym.name);
+            InherentImplEntry {
                 file: sym.file_path,
                 line: sym.line,
                 impl_id: sym.id,
-                method_count: count as u32,
-            });
-        }
+                method_count: count,
+            }
+        })
+        .collect();
 
-        let resp = InherentImplsResponse {
-            type_name: params.type_name,
-            impls,
-        };
-        Ok(serde_json::json!(resp))
-    })
-    .await
+    let resp = InherentImplsResponse {
+        type_name: params.type_name,
+        impls,
+    };
+    Ok(serde_json::json!(resp))
 }
 
 async fn inherent_impls_of_type(
@@ -941,6 +934,10 @@ mod tests {
 
         let reader_pool = DbPool::open_with_size(&DbConfig::new(&path), 4).expect("reader pool opens");
         let writer_handle = BatchWriter::new(db, BatchConfig::default());
+        let read_model = crate::model::ReadModel::new();
+        crate::model::read_model::build_and_set(&reader_pool, &read_model, "ws")
+            .await
+            .expect("read-model snapshot builds");
         let state: SharedState = Arc::new(AppState {
             writer: writer_handle,
             reader_pool,
@@ -948,6 +945,8 @@ mod tests {
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
+            read_model,
+            startup: crate::server::startup::StartupState::ready(),
         });
         (state, path)
     }

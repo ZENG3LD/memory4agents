@@ -176,11 +176,17 @@ async fn run_reindex_driver(
         };
         let _guard = state.index_locks.acquire(&workspace_id).await;
         match Indexer::run_changed_paths(&state.reader_pool, &state.writer, &req, batch).await {
-            Ok(result) => tracing::info!(
-                files_indexed = result.files_indexed,
-                symbols = result.symbols_extracted,
-                "watch-triggered incremental reindex"
-            ),
+            Ok(result) => {
+                tracing::info!(
+                    files_indexed = result.files_indexed,
+                    symbols = result.symbols_extracted,
+                    "watch-triggered incremental reindex"
+                );
+                // Piece 0.12: same rebuild trigger `server::routes::index::post_index_impl`
+                // fires after a synchronous `POST /index` — off the request
+                // path, single-flight + coalesced.
+                crate::model::read_model::request_rebuild(&state, workspace_id.clone());
+            }
             Err(e) => tracing::warn!("watch-triggered reindex failed: {e}"),
         }
     }
@@ -633,6 +639,8 @@ mod tests {
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
+            read_model: crate::model::ReadModel::new(),
+            startup: crate::server::startup::StartupState::ready(),
         });
 
         let root_path = dir.to_string_lossy().replace('\\', "/");
@@ -686,6 +694,26 @@ mod tests {
             "a filesystem event's debounced trigger (fired from the plain debounce thread) must \
              start the reindex driver and land a file_records row — before the fix, spawning it \
              via bare `tokio::spawn` from that thread panicked instead"
+        );
+
+        // Piece 0.12: the same watch-triggered reindex must also rebuild
+        // the read-model snapshot (`model::read_model::request_rebuild`,
+        // called from `run_reindex_driver` right after a successful run) —
+        // poll since the rebuild itself runs on a separately spawned task.
+        let snapshot_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut snapshot_has_symbol = false;
+        while std::time::Instant::now() < snapshot_deadline {
+            if let Some(snap) = state.read_model.get("ws") {
+                if snap.stats().symbol_count > 0 {
+                    snapshot_has_symbol = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            snapshot_has_symbol,
+            "a watch-triggered reindex must rebuild the workspace's read-model snapshot"
         );
 
         drop(state);

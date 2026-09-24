@@ -4,7 +4,7 @@ use crate::server::state::SharedState;
 
 mod ast;
 mod graph;
-mod health;
+pub(crate) mod health;
 mod index;
 mod mcp;
 mod usage;

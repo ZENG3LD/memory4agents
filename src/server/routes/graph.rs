@@ -4,9 +4,10 @@ use axum::{
 };
 use mcp_service4agent::router::{DocRouter, RouteDoc};
 use serde::Deserialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use crate::db::reader;
-use crate::server::state::{with_db, AppError, SharedState};
+use crate::server::state::{snapshot, snapshots_for, with_db, AppError, SharedState};
+use crate::types::Symbol;
 
 /// Depth cap for `/graph/impact_symbol`'s caller BFS — mirrors `/ast/cluster`'s
 /// own depth cap (`server/routes/ast.rs`).
@@ -67,16 +68,21 @@ pub(crate) struct HotspotsQuery {
     pub(crate) limit: Option<u32>,
 }
 
+/// Piece 0.12: reads the read model — see `Snapshot::crate_nodes`/
+/// `Snapshot::crate_dep_edges`. Merges across every loaded workspace when
+/// `params.workspace` is `None`.
 pub(crate) async fn list_crates_impl(
     state: &SharedState,
     params: WorkspaceQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let nodes = reader::list_crate_nodes(db, params.workspace.as_deref())?;
-        let edges = reader::list_crate_deps(db, params.workspace.as_deref())?;
-        Ok(serde_json::json!({ "nodes": nodes, "edges": edges }))
-    })
-    .await
+    let snaps = snapshots_for(state, params.workspace.as_deref())?;
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for snap in &snaps {
+        nodes.extend(snap.crate_nodes().iter().cloned());
+        edges.extend(snap.crate_dep_edges().iter().cloned());
+    }
+    Ok(serde_json::json!({ "nodes": nodes, "edges": edges }))
 }
 
 async fn list_crates(
@@ -112,34 +118,33 @@ async fn files_in_crate(
     Ok(Json(files_in_crate_impl(&state, params).await?))
 }
 
+/// Piece 0.12: reads the read model — see `Snapshot::reverse_deps_of_file`.
 pub(crate) async fn impact_analysis_impl(
     state: &SharedState,
     params: FileQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let workspace = params.workspace.as_deref().unwrap_or("");
+    let workspace = params.workspace.as_deref().unwrap_or("");
+    let snap = snapshot(state, workspace)?;
 
-        // BFS over reverse file dependencies
-        let mut visited: HashSet<String> = HashSet::new();
-        let mut queue: VecDeque<String> = VecDeque::new();
-        queue.push_back(params.file.clone());
-        visited.insert(params.file.clone());
+    // BFS over reverse file dependencies
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(params.file.clone());
+    visited.insert(params.file.clone());
 
-        while let Some(current) = queue.pop_front() {
-            let reverse_deps = reader::get_reverse_file_deps(db, workspace, &current)?;
-            for dep in reverse_deps {
-                if visited.insert(dep.clone()) {
-                    queue.push_back(dep);
-                }
+    while let Some(current) = queue.pop_front() {
+        let reverse_deps = snap.reverse_deps_of_file(&current);
+        for dep in reverse_deps {
+            if visited.insert(dep.clone()) {
+                queue.push_back(dep);
             }
         }
+    }
 
-        // Remove the seed file itself from results — callers only want affected files
-        visited.remove(&params.file);
-        let affected: Vec<String> = visited.into_iter().collect();
-        Ok(serde_json::json!({ "file": params.file, "affected": affected }))
-    })
-    .await
+    // Remove the seed file itself from results — callers only want affected files
+    visited.remove(&params.file);
+    let affected: Vec<String> = visited.into_iter().collect();
+    Ok(serde_json::json!({ "file": params.file, "affected": affected }))
 }
 
 async fn impact_analysis(
@@ -171,66 +176,74 @@ pub(crate) struct SymbolImpactQuery {
 /// second, unrelated definition with the exact same name in the SAME
 /// workspace is indistinguishable from the intended one until SCIP can
 /// disambiguate by qualified path.
+/// Piece 0.12: reads the read model — see `Snapshot::callers_of`. Merges
+/// across every loaded workspace when `params.workspace` is `None`, capped
+/// at `model::MAX_CALLERS` per BFS level (same cap `ast::callers_of_symbol_impl`
+/// applies to its own multi-workspace merge).
 pub(crate) async fn impact_analysis_symbol_impl(
     state: &SharedState,
     params: SymbolImpactQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let workspace = params.workspace.as_deref();
-        let depth = params
-            .depth
-            .unwrap_or(DEFAULT_IMPACT_SYMBOL_DEPTH)
-            .min(MAX_IMPACT_SYMBOL_DEPTH);
+    let snaps = snapshots_for(state, params.workspace.as_deref())?;
+    let depth = params
+        .depth
+        .unwrap_or(DEFAULT_IMPACT_SYMBOL_DEPTH)
+        .min(MAX_IMPACT_SYMBOL_DEPTH);
 
-        let mut visited_names: HashSet<String> = HashSet::new();
-        visited_names.insert(params.sym.clone());
-        let mut seen_ids: HashSet<i64> = HashSet::new();
-        let mut affected: Vec<crate::types::Symbol> = Vec::new();
-        let mut frontier: Vec<String> = vec![params.sym.clone()];
+    let mut visited_names: HashSet<String> = HashSet::new();
+    visited_names.insert(params.sym.clone());
+    let mut seen_ids: HashSet<i64> = HashSet::new();
+    let mut affected: Vec<Symbol> = Vec::new();
+    let mut frontier: Vec<String> = vec![params.sym.clone()];
 
-        for _ in 0..depth {
-            let mut next_frontier: Vec<String> = Vec::new();
-            for name in &frontier {
-                let callers = reader::get_callers_of(db, name, workspace)?;
-                for caller in callers {
-                    if !seen_ids.insert(caller.id) {
-                        continue;
-                    }
-                    if visited_names.insert(caller.name.clone()) {
-                        next_frontier.push(caller.name.clone());
-                    }
-                    affected.push(caller);
+    for _ in 0..depth {
+        let mut next_frontier: Vec<String> = Vec::new();
+        for name in &frontier {
+            let mut callers: Vec<Symbol> = Vec::new();
+            for snap in &snaps {
+                if callers.len() >= crate::model::MAX_CALLERS {
+                    break;
                 }
+                callers.extend(snap.callers_of(name));
             }
-            if next_frontier.is_empty() {
-                break;
+            callers.truncate(crate::model::MAX_CALLERS);
+            for caller in callers {
+                if !seen_ids.insert(caller.id) {
+                    continue;
+                }
+                if visited_names.insert(caller.name.clone()) {
+                    next_frontier.push(caller.name.clone());
+                }
+                affected.push(caller);
             }
-            frontier = next_frontier;
         }
+        if next_frontier.is_empty() {
+            break;
+        }
+        frontier = next_frontier;
+    }
 
-        let mut affected_files: Vec<String> = affected.iter().map(|s| s.file_path.clone()).collect();
-        affected_files.sort();
-        affected_files.dedup();
+    let mut affected_files: Vec<String> = affected.iter().map(|s| s.file_path.clone()).collect();
+    affected_files.sort();
+    affected_files.dedup();
 
-        let affected_symbols: Vec<serde_json::Value> = affected
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "name": s.name,
-                    "file": s.file_path,
-                    "line": s.line,
-                    "kind": s.kind.to_string(),
-                })
+    let affected_symbols: Vec<serde_json::Value> = affected
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "file": s.file_path,
+                "line": s.line,
+                "kind": s.kind.to_string(),
             })
-            .collect();
+        })
+        .collect();
 
-        Ok(serde_json::json!({
-            "symbol": params.sym,
-            "affected_symbols": affected_symbols,
-            "affected_files": affected_files,
-        }))
-    })
-    .await
+    Ok(serde_json::json!({
+        "symbol": params.sym,
+        "affected_symbols": affected_symbols,
+        "affected_files": affected_files,
+    }))
 }
 
 async fn impact_analysis_symbol(
@@ -240,16 +253,34 @@ async fn impact_analysis_symbol(
     Ok(Json(impact_analysis_symbol_impl(&state, params).await?))
 }
 
+/// Piece 0.12: reads the read model — see `Snapshot::hotspots`. When
+/// `params.workspace` is `None`, sums in-degree counts for the same
+/// `to_file` string across every loaded workspace before ranking —
+/// mirrors `get_hotspots`'s own `workspace_id: None` (no `WHERE`, so its
+/// `GROUP BY to_file` already merges rows from every workspace that happen
+/// to share a `to_file` value).
 pub(crate) async fn hotspots_impl(
     state: &SharedState,
     params: HotspotsQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let limit = params.limit.unwrap_or(20);
-        let result = reader::get_hotspots(db, params.workspace.as_deref(), limit)?;
-        Ok(serde_json::json!(result))
-    })
-    .await
+    let limit = params.limit.unwrap_or(20);
+    let snaps = snapshots_for(state, params.workspace.as_deref())?;
+
+    if let [only] = snaps.as_slice() {
+        return Ok(serde_json::json!(only.hotspots(limit)));
+    }
+
+    let mut merged: HashMap<String, u32> = HashMap::new();
+    for snap in &snaps {
+        for (file, count) in snap.hotspots(u32::MAX) {
+            *merged.entry(file).or_insert(0) += count;
+        }
+    }
+    let mut result: Vec<(String, u32)> = merged.into_iter().collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result.sort_by_key(|r| std::cmp::Reverse(r.1));
+    result.truncate(limit as usize);
+    Ok(serde_json::json!(result))
 }
 
 async fn hotspots(
@@ -266,24 +297,23 @@ pub(crate) struct ResolveQuery {
 }
 
 /// Returns all symbols matching `sym` along with the crate that owns each one.
+/// Piece 0.12: reads the read model — see `Snapshot::resolve_symbol_to_crate`.
 pub(crate) async fn resolve_symbol_impl(
     state: &SharedState,
     params: ResolveQuery,
 ) -> Result<serde_json::Value, AppError> {
-    with_db(state, move |db| {
-        let hits = reader::resolve_symbol_to_crate(db, &params.workspace, &params.sym)?;
-        let results: Vec<serde_json::Value> = hits
-            .into_iter()
-            .map(|(sym, crate_node)| {
-                serde_json::json!({
-                    "symbol": sym,
-                    "crate": crate_node,
-                })
+    let snap = snapshot(state, &params.workspace)?;
+    let hits = snap.resolve_symbol_to_crate(&params.sym);
+    let results: Vec<serde_json::Value> = hits
+        .into_iter()
+        .map(|(sym, crate_node)| {
+            serde_json::json!({
+                "symbol": sym,
+                "crate": crate_node,
             })
-            .collect();
-        Ok(serde_json::json!({ "sym": params.sym, "results": results }))
-    })
-    .await
+        })
+        .collect();
+    Ok(serde_json::json!({ "sym": params.sym, "results": results }))
 }
 
 async fn resolve_symbol(
@@ -421,6 +451,12 @@ mod tests {
 
         let reader_pool = DbPool::open_with_size(&DbConfig::new(&path), 4).expect("reader pool opens");
         let writer_handle = BatchWriter::new(db, BatchConfig::default());
+        let read_model = crate::model::ReadModel::new();
+        for ws in ["ws", "other-ws"] {
+            crate::model::read_model::build_and_set(&reader_pool, &read_model, ws)
+                .await
+                .expect("read-model snapshot builds");
+        }
         let state: SharedState = Arc::new(AppState {
             writer: writer_handle,
             reader_pool,
@@ -428,6 +464,8 @@ mod tests {
             stats_cache: Arc::new(RwLock::new(StatsCache::empty())),
             index_locks: IndexLocks::new(),
             last_index: Arc::new(RwLock::new(None)),
+            read_model,
+            startup: crate::server::startup::StartupState::ready(),
         });
         (state, path)
     }
