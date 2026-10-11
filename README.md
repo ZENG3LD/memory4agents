@@ -1,5 +1,11 @@
 # memory4agent
 
+Renamed in 0.3.0. The previous crate was `dig2memory` (crates.io `dig2memory`
+0.2.0 and 0.2.1, binaries `dig2memory` and `dig2memory-server`, repository
+[ZENG3LD/dig2memory](https://github.com/ZENG3LD/dig2memory)). Those releases
+stay under that name. This crate is `memory4agent`; the repository is
+[ZENG3LD/memory4agents](https://github.com/ZENG3LD/memory4agents).
+
 Code-intelligence and memory infrastructure for coding agents (Claude Code,
 Codex, Kimi, Grok CLIs and others). Indexes codebases using tree-sitter AST
 parsing, builds dependency graphs, and provides fuzzy symbol search, caller
