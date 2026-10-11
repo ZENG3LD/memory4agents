@@ -102,7 +102,7 @@ cd memory4agent && MEMORY4AGENT_DATA_DIR="./data" ./target/release/memory4agent-
 ```
 
 Env vars: `MEMORY4AGENT_PORT` (default 18200), `MEMORY4AGENT_DATA_DIR`
-(default `./data`; the live service sets this to `./data`),
+(default `./data`),
 `MEMORY4AGENT_READER_POOL_SIZE` (default 8 — number of concurrent
 `storage::DbPool` connections, see "Storage engine" above). The CLI's
 `--db` flag overrides both env vars; if

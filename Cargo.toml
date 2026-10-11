@@ -1,10 +1,11 @@
 [package]
 name = "memory4agent"
-version = "0.2.10"
+version = "0.2.11"
 edition = "2021"
 description = "Code-intelligence and memory infrastructure for coding agents: AST index, dependency graph, and fuzzy search server"
 license = "MIT"
-repository = "https://github.com/ZENG3LD/dig2memory"
+repository = "https://github.com/ZENG3LD/memory4agents"
+exclude = ["CLAUDE.md", "DEBUGGING.md"]
 
 [workspace]
 
